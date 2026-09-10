@@ -1,0 +1,15 @@
+# Environment / secrets — never commit real credentials.
+.env
+
+# Python bytecode and cache.
+__pycache__/
+*.pyc
+
+# Virtual environments.
+.venv/
+
+# Pytest and coverage artifacts.
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
