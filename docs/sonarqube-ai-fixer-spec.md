@@ -1,12 +1,13 @@
-# SonarQube AI Auto-Fixer — Domain & Behaviour Specification (T04–T27)
+# SonarQube AI Auto-Fixer — Domain & Behaviour Specification (T04–T28)
 
-Status: **POC implementation complete (T01–T26)** · T20 (safe, fail-closed,
+Status: **POC implementation complete (T01–T28)** · T20 (safe, fail-closed,
 exactly-one-commit Git commit), T21 (safe, fail-closed, exactly-one-push Git
 push of a T20 `COMMITTED` result), T22/T23 (the overall and per-issue reports),
 T24/T25 (the max-issue / max-iteration policy limits), T26 (the standalone
-main/default branch-protection policy, §18) and T27 (the standalone fail-closed
-uncertainty policy, §19) are implemented; none of them is
-wired into `main.py`, and T28+ is deliberately not implemented · No
+main/default branch-protection policy, §18), T27 (the standalone fail-closed
+uncertainty policy, §19) and T28 (the standalone exact-match Sonar rule
+allowlist, §20) are implemented; none of them is
+wired into `main.py`, and T29+ is deliberately not implemented · No
 real SonarQube credentials and no real push are ever made by this tool (every
 T21 push targets a bare repository under `tmp_path`) · Tests never invoke a real
 Codex CLI, never need a real project toolchain, never need a live SonarQube
@@ -40,14 +41,16 @@ fix one SonarQube issue in a **local clone** of the analysed repository:
 16. classifies the attempt as `FIXED`, `STILL_OPEN`, `ANALYSIS_FAILED`,
     `TESTS_FAILED`, `SCOPE_INVALID`, `CODEX_FAILED` or `REVIEW_REQUIRED` (T19).
 
-T20–T27 (commits §11, pushes §12, reporting §13–§14, the two policy limits
-§15–§16, branch protection §18 and the uncertainty policy §19) are implemented
+T20–T28 (commits §11, pushes §12, reporting §13–§14, the two policy limits
+§15–§16, branch protection §18, the uncertainty policy §19 and the Sonar rule
+allowlist §20) are implemented
 and documented below. PR
 creation, retry/iteration **loops**, orchestration, branch/rule *enforcement*
 and container/CI wiring remain **out of scope** for this document and for the
-codebase — T26 decides whether a branch is safe to mutate and T27 decides
-whether the evidence authorises the mutation, but nothing enforces either
-decision yet, and neither of them touches Git. T16–T19 deliberately
+codebase — T26 decides whether a branch is safe to mutate, T27 decides whether
+the evidence authorises the mutation and T28 decides whether the rule may be
+fixed by an AI agent at all, but nothing enforces any of those decisions yet,
+and none of them touches Git. T16–T19 deliberately
 stop at *verifying and classifying* the attempt: nothing is committed, nothing
 is pushed, nothing is retried, no SonarQube issue is resolved or closed, and no
 source code is modified by these stages.
@@ -81,7 +84,8 @@ source code is modified by these stages.
 | T20 | Safe, fail-closed, exactly-one-commit Git commit of a verified fix | `commit_message.py`, `commit_policy.py`, `git_commit.py` | ✔ |
 | T21 | Safe, fail-closed, exactly-one-push Git push of a T20 `COMMITTED` result | `push_policy.py`, `git_push.py` | ✔ |
 | T22–T27 | Reporting (§13–§14), the two policy limits (§15–§16), branch protection (§18) and the uncertainty policy (§19) | `overall_report.py`, `per_issue_report.py`, `issue_limit.py`, `iteration_limit.py`, `branch_protection.py`, `uncertainty_policy.py` | ✔ (none wired) |
-| T28+ | PRs, retry loops, orchestration, CI, containers | — | ✖ not implemented |
+| T28 | Sonar rule allowlist policy (exact match, fail-closed, §20) | `sonar_rule_allowlist.py` | ✔ (standalone, not wired) |
+| T29+ | PRs, retry loops, orchestration, CI, containers | — | ✖ not implemented |
 
 ## 3. Actors and system context
 
@@ -3649,4 +3653,451 @@ the focused run (`pytest tests/test_uncertainty_policy.py
 8. **Given** any inputs, **then** no I/O, no Git operation, no command and no
    mutation occurs, no caller-authored text (other than a valid diagnostic code)
    is published, and the required-evidence table cannot be weakened.
+
+## 20. T28 — Sonar rule allowlist (implemented policy layer, not wired)
+
+Status: **implemented** (`sonar_rule_allowlist.py`, version `t28.1`) · standalone
+· pure · deterministic · immutable · fail-closed · **unwired** (`main.py` and
+T19–T27 unchanged).
+
+### 20.1 Purpose, scope and non-goals
+
+T28 answers exactly one question:
+
+    "is this SonarQube rule explicitly allowed to be fixed automatically?"
+
+The default answer is **no**. The default configuration is an empty allowlist, so
+every rule is denied until an operator states the exact rule IDs they approve.
+T28 does not decide whether a Sonar issue is safe to fix based on severity,
+issue type, language, confidence, historical success, or message content. It
+only answers whether the exact Sonar rule ID is explicitly allowlisted.
+
+**In scope:** the rule ID grammar (§20.3); the allowlist configuration contract
+(§20.4); validation and refusal clauses (§20.5); the bounds (§20.6); the statuses
+(§20.7); the precedence (§20.8); the fail-closed rule (§20.9); the trust boundary
+(§20.10); compatibility with the repository's own rule-key contract (§20.11);
+immutability, purity, determinism and secret safety (§20.12); serialization
+(§20.13); the tests (§20.14); the integration boundary (§20.15); the acceptance
+criteria (§20.16).
+
+**Non-goals (explicit):**
+
+* no wildcards, no globs, no regexes and no prefix/suffix/substring/family
+  matching — only exact string identity;
+* no "allow all" switch, no implicit default entry and no configuration that
+  permits more than the listed IDs;
+* no severity, issue-type, language, file-extension, confidence, success-rate or
+  history input — those values cannot even be expressed to T28 (§20.10);
+* no SonarQube lookup (T28 never asks whether a rule exists, whether it is
+  active in a quality profile, or whether an issue carries it);
+* no code modification, no Git, no commit, no push, no retry, no orchestration,
+  no reporting, no PR creation;
+* no wiring into `main.py` (or any other module) in this task (§20.16).
+
+### 20.2 The one rule — exact match, and nothing else
+
+An automatic fix is authorised **only** when the rule ID the caller states is
+*exactly* one of the rule IDs the operator configured:
+
+    rule_id in allowed_rules   <=>   status is ALLOWED   <=>   can_auto_fix
+
+The implementation makes that structural rather than conventional: the validated
+configuration is turned into a `frozenset` and the only permission test in the
+module is membership of that set. The module does not import `re`, `fnmatch`,
+`glob`, `difflib` or `unicodedata`, and it calls no `startswith`, `endswith`,
+`casefold`, `lower`, `upper`, `strip`, `find`, `count` or `replace` — tests
+assert both facts, and an AST test asserts that every `in`/`not in` comparison in
+the module compares against a *name* (a set/tuple), never a string literal, so no
+substring test can exist anywhere.
+
+Consequences that the tests pin explicitly:
+
+| Value the caller states | Allowlist | Result |
+|-------------------------|-----------|--------|
+| `S1118` | `("S1118",)` | `ALLOWED` |
+| `S1118` | `("S111",)` | `RULE_NOT_ALLOWED` |
+| `S1118` | `("S1118x",)` | `RULE_NOT_ALLOWED` |
+| `S1118` | `("xS1118",)` | `RULE_NOT_ALLOWED` |
+| `S1118` | `("s1118",)` | `RULE_NOT_ALLOWED` (case is identity) |
+| `S1118` | `("java:S1118",)` | `RULE_NOT_ALLOWED` |
+| `java:S1118` | `("S1118",)` | `RULE_NOT_ALLOWED` (the qualifier is identity) |
+| `S1118*` | `("S1118",)` or `("S1118*",)` | `INVALID_RULE_ID` / `INVALID_POLICY` |
+| `S9999` | `("S1118",)` | `RULE_NOT_ALLOWED` (unknown is not an error) |
+
+A wildcard is therefore never a tolerance: `S11*` is not a "rule family", it is a
+malformed rule ID when supplied as input and an unusable configuration entry when
+supplied in the allowlist. Wildcard support, if it is ever wanted, is a new
+version of this policy rather than a flag in this one.
+
+### 20.3 Supported rule grammar
+
+A rule ID is deliberately narrow. It is **ASCII only** and at most
+`MAX_RULE_ID_LENGTH` = **64 characters**, and it has this shape:
+
+```
+rule-id     := key | qualifier ":" key
+key         := lead tail*
+qualifier   := lead tail*
+lead        := [A-Za-z0-9]                 # one ASCII letter or digit
+tail        := [A-Za-z0-9._-]              # letters, digits, ".", "_", "-"
+```
+
+The two forms cover exactly what this repository's SonarQube model actually
+carries: the bare rule key SonarQube reports for the languages in this project
+(`S1118`, `S1192`, `S3776`) and the language/repository-qualified key it reports
+as well (`python:S1481`, `java:S108`, `javascript:S1854`, `csharpsquid:S1118` —
+all of which already appear in this repository's fixtures, its commit-message
+layer and the `SonarIssue` model). The three separators `"."`, `"_"` and `"-"`
+are supported because real SonarQube rule keys contain them
+(`common-java:DuplicatedBlocks`, `external_eslint_repo:no-unused-vars`); nothing
+else is.
+
+The grammar is deliberately **not** a general "Sonar rule syntax" parser: there
+is exactly one optional `:` separator, at most two parts, no nesting, no URI
+form, no plugin/module form and no version syntax.
+
+Every one of the following is **refused** (`INVALID_RULE_ID` when supplied as
+input, `INVALID_POLICY` when supplied as a configuration entry):
+
+| Class | Examples |
+|-------|----------|
+| empty | `` (the empty string) |
+| whitespace-only / padded | `" "`, `"\t"`, `"S1118 "`, `" S1118"`, `"S 1118"` |
+| control characters | `"S1118\n"`, `"S1118\r"`, `"S1118\t"`, `"S1118\x00"` |
+| non-ASCII | `"S1118é"`, `"１１１８"`, `"S1118\u00a0"` |
+| wildcards | `"*"`, `"**"`, `"S11*"`, `"S1118*"`, `"S11?"`, `"S111[8]"` |
+| regex syntax | `"^S11"`, `"S11$"`, `"(?i)S1118"`, `".*"`, `"S.*"`, `"S11+"` |
+| path-like | `"/etc/passwd"`, `"../../S1118"`, `"C:\Windows\S1118"`, `"src/S1118"` |
+| URL-like | `"https://sonar.example.com/api/rules"`, `"http://S1118"` |
+| shell fragments | `"S1118; rm -rf /"`, `"$(id)"`, `` "`id`" ``, `"S1118\|id"` |
+| separator errors | `":"`, `":S1118"`, `"S1118:"`, `"S1118::S1"`, `"a:b:c"` |
+| bad leading character | `".S1118"`, `".."`, `"-S1118"`, `"_S1118"` |
+| too long | any value longer than 64 characters |
+
+Nothing is ever repaired: T28 does **not** strip whitespace, does not lowercase,
+does not escape, does not truncate and does not coerce (`True`, `7`, `1.5`,
+`b"S1118"`, `pathlib.Path("S1118")` and arbitrary objects are refused as
+`INVALID_INPUT`, never converted with `str()`). The only normalisation anywhere
+in T28 is none at all: the caller's exact string is either an exact entry or it
+is not.
+
+### 20.4 Configuration contract
+
+```python
+RuleAllowlistPolicy(allowed_rules=("S1118", "S1192", "S3776"))
+```
+
+* `allowed_rules` is the list of rule IDs an automatic fix is approved for.
+  Only an **immutable `tuple`** is accepted. `None`, a `list`, a `set`, a
+  `frozenset`, a `dict`, a bare string, `bytes`, a generator/iterator and every
+  other non-tuple are refused (`INVALID_POLICY`): a structure that can be
+  mutated or reordered *after* it was validated cannot state a curated allowlist,
+  and a bare string would silently be iterated character by character.
+* The **default is the empty tuple**, which is valid and maximally strict: it
+  allows no rule at all. That is the fail-closed default — nothing is enabled by
+  omitting configuration, and there is no hidden default entry.
+* Every entry must be a `str` that satisfies the grammar of §20.3. An entry of
+  another type (`7`, `True`, `None`, `1.5`, `b"S1118"`, a `Path`, a nested
+  tuple) is refused as well.
+* **A duplicate entry is an error, not a deduplication.** `("S1118", "S1118")`
+  is `INVALID_POLICY`, because silently collapsing it would hide a configuration
+  mistake. Duplicates are compared as *exact* strings, so `("S1118", "s1118")` is
+  a valid two-entry allowlist (they are two different rule identities) while
+  `("S1118", "S1118")` is refused.
+* The refusal reason names the offending entry by **index** (`allowed rule entry
+  2`) and describes the class of the problem; the offending value itself is never
+  echoed (§20.12).
+
+### 20.5 Validation (what is refused, and in which order)
+
+The configuration is validated first, and in this order: **shape**, then
+**size**, then every entry in configuration order. Which means, for example, that
+an oversized tuple is reported as oversized even when it also contains a wildcard
+entry — the bound is enforced before any entry is read.
+
+The caller's rule identity is validated next: the value must be a `str` (else
+`INVALID_INPUT`) that satisfies the grammar of §20.3 (else `INVALID_RULE_ID`).
+Both refusals are produced for exactly the cases listed in §20.3, and the
+distinction is deliberate: a **type** problem is `INVALID_INPUT` and a
+**content** problem is `INVALID_RULE_ID`, so a log can separate "the caller sent
+the wrong kind of value" from "the caller sent a value that is not a rule ID".
+The two sets are disjoint by construction, and tests pin that every non-string
+value lands on the first and every malformed string on the second.
+
+### 20.6 Limits (explicit, constant, tested at max-1 / max / max+1)
+
+| Constant | Value | Why |
+|----------|-------|-----|
+| `MAX_RULE_ID_LENGTH` | `64` characters (qualifier included) | The longest rule key in this repository's own fixtures is 16 characters (`javascript:S1854`) and the widest real SonarQube analyzer key is well under 40, so 64 is roughly four times the widest real value. It also stays below T20's generic 100-character token cap, so every rule ID T28 accepts can still be published in a T20 commit message (§20.11). |
+| `MAX_ALLOWED_RULES` | `1000` entries | A curated list of rules an AI agent is trusted to fix by itself is expected to be a few dozen long. A list of thousands is not a curation but an attempt to allow everything — the exact failure mode this policy exists to prevent. The bound also keeps every validation and comparison in T28 strictly bounded work. |
+
+Both bounds are enforced *before* the work they bound, both are published in the
+serialized policy, and both are covered by boundary tests.
+
+### 20.7 Statuses
+
+| Status | Value | Meaning |
+|--------|-------|---------|
+| `ALLOWED` | `allowed` | The rule ID is exactly one of the allowlisted rule IDs. The **only** status that authorises a fix. |
+| `RULE_NOT_ALLOWED` | `rule-not-allowed` | The rule ID is a usable identity but is not listed — the ordinary, expected answer. |
+| `INVALID_RULE_ID` | `invalid-rule-id` | A rule *string* was supplied and it is not a usable rule ID (content problem). |
+| `INVALID_INPUT` | `invalid-input` | The record carries no rule ID *string* at all (`None` or another type). Absence is not "a rule that is merely unlisted". |
+| `INVALID_POLICY` | `invalid-policy` | The allowlist configuration is not usable, so no rule can be shown to be approved. |
+
+A `RuleAllowlistDecision` (`ALLOW`/`REFUSE`) is derived from the status exactly
+like T24–T26, and the stable machine tokens are `T28_RULE_ALLOWED`,
+`T28_RULE_NOT_ALLOWED`, `T28_RULE_ID_INVALID`, `T28_INPUT_INVALID` and
+`T28_POLICY_INVALID`.
+
+### 20.8 Precedence (explicit, documented and pinned)
+
+```
+INVALID_POLICY  ->  INVALID_INPUT  ->  INVALID_RULE_ID  ->  RULE_NOT_ALLOWED  ->  ALLOWED
+```
+
+The first status whose condition holds decides the verdict. It is deliberately
+"policy, then identity, then lookup":
+
+* an allowlist T28 cannot read refuses **before** any rule is read, so a
+  configuration error can never be reported as `RULE_NOT_ALLOWED` (a judgement
+  about a list that could not be read) and, above all, can never be reported as
+  `ALLOWED`;
+* a record that carries no rule string refuses **before** the value is examined;
+* a malformed rule string refuses **before** the allowlist is consulted;
+* only a well-formed rule identity is ever looked up, and only exact membership
+  decides `ALLOWED` versus `RULE_NOT_ALLOWED`.
+
+`PRECEDENCE` is exported as a tuple, a test pins it to exactly that order, and
+every adjacent pair has at least one test case that proves which condition wins
+(when both could apply, and — for `INVALID_INPUT` versus `INVALID_RULE_ID` —
+that they are disjoint by construction).
+
+### 20.9 Fail-closed behaviour
+
+`can_auto_fix` is the only permission flag. It is a *derived* property
+(`decision is ALLOW`, and `decision` is `ALLOW` only when `status` is in
+`ALLOWED_STATUSES`, which contains exactly `ALLOWED`), so a refusal cannot
+report permission and an `ALLOWED` verdict cannot carry a refusal status. A test
+asserts `can_auto_fix is (status is ALLOWED)` for allowed, unlisted, malformed,
+absent, empty-allowlist, `None`-allowlist, list-allowlist, duplicate-entry and
+pattern-entry cases alike.
+
+| Input | Result | `can_auto_fix` |
+|-------|--------|----------------|
+| unusable allowlist (anything but a valid tuple) | `INVALID_POLICY` | `False` |
+| no rule stated (`None`) | `INVALID_INPUT` | `False` |
+| rule is not a string | `INVALID_INPUT` | `False` |
+| rule is not a usable rule ID | `INVALID_RULE_ID` | `False` |
+| well-formed rule that is not listed | `RULE_NOT_ALLOWED` | `False` |
+| exactly listed rule | `ALLOWED` | `True` |
+
+Nothing but exact membership can reach the last row. T28 has no parameter, no
+field, no constant and no branch through which severity, issue type, rule
+family, rule prefix, file extension, language, historical success, confidence, a
+previous-fix count or Sonar message text could influence the verdict — those
+values cannot even be supplied (a test asserts the two public call parameters
+and the single field of each DTO, and that no module-level name mentions them).
+
+### 20.10 Trust boundary
+
+Both inputs are **caller-asserted**. T28 establishes no fact about SonarQube: it
+does not know whether the rule exists, whether it is active in the quality
+profile, whether an issue really carries it, or whether a fix for it would be
+correct. It validates the *shape* of the rule identity and performs one exact
+membership test against the operator's list. A caller that misreports which rule
+an issue carries is not detected here — and a caller that wants a rule allowed
+must state that rule ID in the configuration explicitly.
+
+This is a **policy boundary**, not an evidence-authentication boundary: it exists
+so that a future orchestration layer cannot *accidentally* let the AI fixer edit
+code for a rule the operator never approved, and so that the deny-by-default
+behaviour does not depend on any other layer remembering to check something.
+T28 never calls SonarQube, never reads a quality profile, never reads a file and
+never inspects an issue: the rule ID is whatever the caller says it is.
+
+### 20.11 Compatibility with the repository's own rule-key contract (T20)
+
+The rule IDs T28 accepts are a strict **subset** of the rule keys the existing
+commit layer accepts: T20's `commit_message` validates a rule key as
+`[A-Za-z0-9][A-Za-z0-9._:-]*` with a 100-character cap, and T28 accepts an
+ASCII-only, at-most-64-character, at-most-one-separator subset of that same
+alphabet. A test iterates every rule ID from the T28 valid set and builds a real
+T20 commit message with it, asserting that the rule ID is published in the
+`Sonar-Rule` trailer — so a rule T28 allows can never be impossible to commit.
+
+The two layers do not contradict each other, and they answer different
+questions: T20 asks "is this message safe to hand to Git?", T28 asks "was this
+rule approved for an automatic fix at all?". Neither imports the other, so the
+policy stays independently testable (§20.15).
+
+### 20.12 Immutability, purity, determinism and secret safety
+
+* **Immutable records.** `RuleAllowlistPolicy`, `RuleAllowlistInput` and
+  `RuleAllowlistEvaluation` are frozen dataclasses; assignment and deletion raise
+  `FrozenInstanceError`, `reasons` is a tuple, and `as_dict()` returns freshly
+  built containers so mutating a serialized copy cannot change a policy or a
+  verdict. The configuration itself must already be a `tuple`, so T28 holds no
+  reference to a structure a caller can still mutate.
+* **No exposed internals.** The lookup set used by the evaluation is built inside
+  the call from the validated tuple and is never published or stored; the public
+  DTOs expose data, not internal sets.
+* **Pure and deterministic.** The verdict is a pure function of
+  `(policy, rule_input)`: no clock, no environment value, no random source, no
+  cache, no counter, no global mutable state, no filesystem, no network, no
+  subprocess and no Git. The same two arguments always produce an equal record
+  (a test pins it, together with "no module state changed" and JSON-native
+  output), and the configuration is consulted in its own order, so the
+  serialized `allowed_rules` list is stable for a given configuration.
+* **Secret and data safety.** Diagnostics are static, bounded and
+  machine-readable. The two positions where caller text could leak are closed:
+  (a) an *unusable* rule ID is never echoed — `rule_id` is reported as `None` and
+  the refusal sentence is fixed text that names no value (a 100 000-character
+  rule ID, a shell fragment, a URL carrying credentials, a path traversal and an
+  over-long entry are all refused without any of them appearing anywhere in the
+  serialized verdict); (b) an *accepted* rule ID is echoed only after a second,
+  independent validation inside the result builder, so the field can never carry
+  an unvalidated string. T28 reads no environment variable, no token, no
+  credential and no issue message, and emits no command or argv.
+
+### 20.13 Serialization
+
+`RuleAllowlistEvaluation.as_dict()` is deterministic, JSON-native and
+secret-free:
+
+```json
+{
+  "policy_version": "t28.1",
+  "status": "allowed",
+  "decision": "allow",
+  "can_auto_fix": true,
+  "rule_id": "S1118",
+  "diagnostic_code": "T28_RULE_ALLOWED",
+  "reason": "Allowed (allowed) for rule 'S1118': the rule ID is exactly one of the allowlisted rule IDs, so this rule is approved for an automatic fix.",
+  "reasons": ["<the same sentence>", "T28 allows only because the exact rule ID is explicitly listed; it proves nothing else about the rule or the issue."],
+  "policy": {
+    "policy_version": "t28.1",
+    "allowed_rules": ["S1118", "S1192", "S3776"],
+    "allowed_rule_count": 3,
+    "maximum_supported_rules": 1000,
+    "maximum_rule_id_length": 64,
+    "is_valid": true,
+    "refusal_reason": null
+  }
+}
+```
+
+* `RuleAllowlistEvaluation.rule_id` is the caller's rule ID **only when it is a
+  usable rule ID** (`null` otherwise); `reasons` is always
+  `(reason, fixed consequence)`.
+* `RuleAllowlistPolicy.as_dict()` publishes the validated entries **in
+  configuration order** (`null` plus a refusal reason when the configuration is
+  unusable, so no malformed entry is echoed) together with both bounds.
+* `RuleAllowlistInput.as_dict()` publishes the rule ID only when it is usable,
+  plus `is_usable_rule_id`.
+* No internal implementation detail (no set, no lookup structure, no counter), no
+  command, no argv, no environment value, no path and no arbitrary input object
+  appears in any of them.
+
+### 20.14 Test guarantees
+
+`tests/test_sonar_rule_allowlist.py` pins, at least:
+
+* every valid rule ID form (bare and qualified) and every refused rule ID class
+  (empty, whitespace-only, padded, control characters, non-ASCII, wildcards,
+  regexes, paths, URLs, shell fragments, separator errors, bad leading
+  characters, over-long values) and every refused non-string value;
+* the maximum-length boundary at max-1 / max / max+1, for an input and for a
+  configuration entry;
+* exact matching: prefix, suffix, substring, extension, case and qualifier
+  collisions in **both** directions, plus the exhaustive
+  `rule_id in allowed_rules <=> ALLOWED` matrix over seven rules × six
+  configurations;
+* configuration validation: the default (empty) allowlist, `None`, every
+  non-tuple container, non-string entries, malformed entries, duplicate entries,
+  the entry bound at max-1 / max / max+1, the entry-length boundary, and the
+  documented order of the refusal checks (size before entries);
+* fail closed: `can_auto_fix is (status is ALLOWED)` and
+  `decision is ALLOW <=> status is ALLOWED` for every case, and that no public
+  parameter or DTO field can carry severity, type, language, confidence, history
+  or message text;
+* precedence: `PRECEDENCE` pinned to the documented order, one conflict case per
+  condition, and the disjointness of the two malformed-input statuses;
+* immutability: frozen assignment and deletion, the immutable configuration, a
+  mutated serialized copy and a mutated caller-owned list;
+* determinism: equal verdicts, unchanged module state, JSON-native output;
+* serialization: the exact key set and values of all three `as_dict()`s;
+* secret/data safety: huge and hostile inputs are refused and never published,
+  and no environment/token/path token appears in a verdict;
+* no wildcard or fuzzy behaviour: pattern entries and well-formed near-misses
+  never match, and the module source contains no matching library import, no
+  string-inspection method call (`startswith`, `casefold`, `strip`, `find`, …)
+  and no string-literal membership test (AST-checked);
+* the module surface: standard library only, no repository import in either
+  direction, no dangerous call, the declared top-level definitions, a sorted
+  `__all__`, read-only module tables and `__test__ = False`;
+* not wired: no other production module (including `main.py`) mentions T28.
+
+`sonar_rule_allowlist.py` is at **100% statement and 100% branch coverage** from
+the focused run (`pytest tests/test_sonar_rule_allowlist.py
+--cov=sonar_rule_allowlist --cov-branch`): 151 statements, 54 branches, 0 missing,
+0 partial. The full test suite passes with the T28 tests included.
+
+### 20.15 Integration status — and `main.py` remains unwired
+
+* **T28 is a library with no caller.** `main.py` and T01–T27 are untouched; no
+  production path imports `sonar_rule_allowlist`, and no existing module gained a
+  dependency on it. Tests pin the absence of such an import **and** the absence
+  of the names `sonar_rule_allowlist`, `RuleAllowlistPolicy`,
+  `RuleAllowlistInput` and `evaluate_rule_allowlist` in every other production
+  module.
+* T28 executes nothing: no Git, no subprocess, no network, no SonarQube call, no
+  Codex call, no file access and no orchestration. It is a decision function and
+  nothing else.
+* A future integration (a later task — **not** T28) would combine the stages that
+  already exist: the T19 issue outcome, the T26 branch protection, the T27
+  uncertainty policy and the T28 rule allowlist. Concretely, it would map the
+  rule identity an issue carries (T04/T18) onto a `RuleAllowlistInput`, call
+  `evaluate_rule_allowlist` with the operator's configured policy, and refuse to
+  let the fixer touch a rule whose `can_auto_fix` is `False` — reporting the
+  stable `diagnostic_code` so the refusal is auditable. That wiring is
+  deliberately **not** part of T28: the policy must be independently testable
+  first, and no orchestration is created prematurely.
+* Until that integration exists, T28 is documentation plus a tested contract: it
+  cannot change what the pipeline does, and the pipeline cannot change what T28
+  answers.
+
+### 20.16 Acceptance criteria
+
+1. **Given** a rule ID that is exactly one of the configured allowlist entries,
+   **then** the verdict is `ALLOWED` with `decision == ALLOW` and
+   `can_auto_fix == True`.
+2. **Given** a well-formed rule ID that is *not* listed — including a prefix,
+   suffix, substring, extension, case variant or the bare/qualified counterpart
+   of a listed rule — **then** the verdict is `RULE_NOT_ALLOWED` with
+   `can_auto_fix == False`.
+3. **Given** a wildcard, glob-like, regex-like, path-like, URL-like,
+   shell-like, padded, whitespace-containing, control-character, non-ASCII,
+   separator-malformed or over-long value, **then** it is refused
+   (`INVALID_RULE_ID` as an input, `INVALID_POLICY` as a configuration entry)
+   with `can_auto_fix == False`.
+4. **Given** a non-string rule value (`None`, `True`/`False`, an integer, a
+   float, `bytes`, a `Path`, a list, a mapping, an arbitrary object), **then**
+   the verdict is `INVALID_INPUT`, nothing is coerced with `str()`, and
+   `can_auto_fix == False`.
+5. **Given** an unusable allowlist (`None`, a non-tuple, a malformed entry, a
+   duplicate entry, an oversized tuple), **then** the verdict is
+   `INVALID_POLICY`, no rule is judged at all — not even a perfectly listed one —
+   and `can_auto_fix == False`.
+6. **Given** both a malformed policy and a malformed rule, **then** the verdict
+   is `INVALID_POLICY`: precedence (§20.8) is exact and documented.
+7. **Given** any inputs, **then** only `ALLOWED` reports `can_auto_fix == True`;
+   every other status reports `False`.
+8. **Given** identical inputs, **then** the verdict is equal, `as_dict()` is
+   identical, the caller's values are unchanged and no module state changed.
+9. **Given** any inputs, **then** no I/O, no Git, no network, no command and no
+   mutation occurs; no caller-authored value other than a *validated* rule ID
+   appears anywhere in the verdict; and no configuration can make a merely
+   similar rule match.
+10. **Given** the default configuration (an empty allowlist), **then** every
+    rule is denied.
 
