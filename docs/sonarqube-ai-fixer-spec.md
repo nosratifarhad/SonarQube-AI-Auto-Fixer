@@ -1,13 +1,15 @@
-# SonarQube AI Auto-Fixer — Domain & Behaviour Specification (T04–T21)
+# SonarQube AI Auto-Fixer — Domain & Behaviour Specification (T04–T25)
 
-Status: **POC implementation complete (T01–T21)** · T20 (safe, fail-closed,
-exactly-one-commit Git commit) and T21 (safe, fail-closed, exactly-one-push Git
-push of a T20 `COMMITTED` result) are implemented; T22+ deliberately not
-implemented · No real SonarQube credentials and no real push are ever made by
-this tool (every T21 push targets a bare repository under `tmp_path`) · Tests
-never invoke a real Codex CLI, never need a real project toolchain, never need a
-live SonarQube server, and never touch the real repository (every T20/T21 test
-uses a real repository under `tmp_path`).
+Status: **POC implementation complete (T01–T25)** · T20 (safe, fail-closed,
+exactly-one-commit Git commit), T21 (safe, fail-closed, exactly-one-push Git
+push of a T20 `COMMITTED` result), T22/T23 (the overall and per-issue reports)
+and T24/T25 (the max-issue / max-iteration policy limits) are implemented; none
+of them is wired into `main.py`, and T26+ is deliberately not implemented · No
+real SonarQube credentials and no real push are ever made by this tool (every
+T21 push targets a bare repository under `tmp_path`) · Tests never invoke a real
+Codex CLI, never need a real project toolchain, never need a live SonarQube
+server, and never touch the real repository (every T20/T21 test uses a real
+repository under `tmp_path`).
 
 ## 1. Purpose
 
@@ -36,11 +38,13 @@ fix one SonarQube issue in a **local clone** of the analysed repository:
 16. classifies the attempt as `FIXED`, `STILL_OPEN`, `ANALYSIS_FAILED`,
     `TESTS_FAILED`, `SCOPE_INVALID`, `CODEX_FAILED` or `REVIEW_REQUIRED` (T19).
 
-T20+ (commits, pushes, PRs, retry/iteration loops, limits, reporting,
-container/CI wiring) is **out of scope** for this document and for the codebase.
-T16–T19 deliberately stop at *verifying and classifying* the attempt: nothing is
-committed, nothing is pushed, nothing is retried, no SonarQube issue is resolved
-or closed, and no source code is modified by these stages.
+T20–T25 (commits §11, pushes §12, reporting §13–§14 and the two policy limits
+§15–§16) are implemented and documented below. PR creation, retry/iteration
+**loops**, orchestration, branch/rule protection and container/CI wiring remain
+**out of scope** for this document and for the codebase. T16–T19 deliberately
+stop at *verifying and classifying* the attempt: nothing is committed, nothing
+is pushed, nothing is retried, no SonarQube issue is resolved or closed, and no
+source code is modified by these stages.
 
 ## 2. Scope of behaviour covered
 
@@ -1256,9 +1260,11 @@ Run: `.venv\Scripts\python -m pytest -q --cov=. --cov-report=term-missing`
 ## 10. Non-goals (unchanged for T22+)
 
 * No PR creation (T22+), no reporting beyond the T22 structured overall report
-  (§13) and no T23 per-issue reporting,
-  retry/iteration loops or limits (T24–T25), no branch/rule protection
-  (T26–T28), no production logging, container, or GitLab CI wiring (T29–T32).
+  (§13) and the T23 per-issue report (§14), no retry or iteration **loops** and
+  no orchestration. The T24/T25 limits (§15, §16) exist as pure policy modules
+  only: they bound a run's issue selection and one issue's retry counter, but
+  nothing calls them and nothing loops. No branch/rule protection (T26–T28) and
+  no production logging, container, or GitLab CI wiring (T29–T32).
 * T20 performs exactly two Git writes and T21 exactly one (see §11, §12), and
   nothing else: they never push more than once, fetch, pull, clone, reset,
   restore, clean, stash, check out, switch, amend, retry, or write
@@ -1736,9 +1742,9 @@ T19 IssueStatusResult  ->  T20 CommitResult  ->  T21 PushResult  ->  T22 Overall
   results through the same `as_dict()` views T21 uses (never `asdict()`, never a
   private attribute).
 * **It is not wired into `main.py`**: `main.py` is byte-for-byte unchanged.
-* It does **not** implement T23 (per-issue reporting), T24–T25 (limits), T26–T28
-  (protections), T29–T32 (logging/containers/CI) and it introduces no
-  `RunContext`.
+* It does **not** implement T23 (per-issue reporting), the T24/T25 limits (which
+  are separate policy modules, §15–§16) or T26–T28 (protections), it does not
+  implement T29–T32 (logging/containers/CI), and it introduces no `RunContext`.
 
 ### 13.2 Inputs
 
@@ -2010,7 +2016,8 @@ neither one is imported by the other).
 * It never rewrites a source status: `t19_status`, `t20_status` and `t21_status`
   are the stages' own values, published verbatim next to the derived outcome.
 * **It is not wired into `main.py`**: `main.py` is byte-for-byte unchanged.
-* It does **not** implement T24–T25 (limits), T26–T28 (protections), T29–T32
+* It does **not** implement the T24/T25 limits (separate policy modules, §15–§16),
+  it does not implement T26–T28 (protections) or T29–T32
   (logging/containers/CI), it introduces no `RunContext`, and it adds no
   orchestration, no policy object, no email/HTML/Markdown reporting and no
   dashboard.
@@ -2230,7 +2237,9 @@ verdicts and the phase trail. `report_version` is `t23.1`.
 ### 14.11 Integration status
 
 * **T23 is a library with no caller**: `main.py` is byte-for-byte unchanged, no
-  orchestrator exists, `RunContext` remains deferred (F2), and T24+ is untouched.
+  orchestrator exists, `RunContext` remains deferred (F2), and T26+ is untouched
+  (the T24/T25 limits are separate, independent policy layers — §15, §16 — and
+  nothing imports them either).
 * T23 consumes already-produced evidence only: it performs no Git/Sonar/Codex/
   network/filesystem mutation of any kind, and the integration test proves a real
   clone is unchanged after a report is built from it.
@@ -2256,4 +2265,581 @@ verdicts and the phase trail. `report_version` is `t23.1`.
    `failed_phase` records where it stopped.
 5. **Given** a report that violates its own derivation invariants, **then**
    `verify_per_issue_report` reports it and the report is never returned as valid.
+
+## 15. T24 — max issue limit (implemented policy layer, not wired)
+
+T24 answers exactly one question and nothing else:
+
+> "may this run process the issue selection it has been handed?"
+
+It is a **pure policy / validation layer**, not orchestration: it retrieves no
+issue, selects no issue, mutates nothing, and it performs no Git, SonarQube,
+Codex, subprocess, network or filesystem operation. `main.py` is byte-for-byte
+unchanged and **nothing calls T24 yet**.
+
+| Module | Role | Side effects |
+|--------|------|--------------|
+| `issue_limit.py` | the immutable policy / selection / verdict records, the validation, the decision ladder and `as_dict()` | **none** |
+
+### 15.1 Purpose, scope and non-goals
+
+* **Purpose**: give a future orchestration layer one deterministic, fail-closed
+  answer to "how many issues may this run process?", so a run can never process
+  more issues than the operator configured.
+* **In scope**: configuration validation, selection validation, the limit
+  decision, the deterministic order of the checks, and the exact reason.
+* **Out of scope**: retrieving issues (T02/T18), filtering them (T03/T04),
+  choosing *which* issues to fix (no ranking, no scoring, no prioritisation —
+  the caller's order is preserved verbatim), truncating a selection, processing
+  an issue, retrying (T25, §16), reporting (T22/T23) and orchestration.
+* **Trust boundary**: both inputs are **caller-asserted**. T24 re-runs nothing
+  and authenticates nothing: it validates the internal consistency of a
+  selection the caller already made and enforces the configured bound. A caller
+  that misreports how many issues it retrieved, or what it selected, is not
+  detected here. This is a policy boundary, not an evidence-authentication
+  boundary — the same distinction §14.2 documents for T23.
+
+### 15.2 The contract
+
+```python
+IssueLimitPolicy(max_issue_limit=None)                               # configuration
+IssueSelection(discovered_issue_count=None, selected_issue_keys=())  # caller input
+evaluate_issue_limit(*, policy, selection) -> IssueLimitEvaluation   # verdict
+```
+
+`max_issue_limit` is the maximum number of issues allowed to **enter the
+processing pipeline for one run**, so an accepted selection always satisfies
+
+```
+selected_issue_count <= max_issue_limit
+```
+
+The bound is applied to the *selected* count (`len(selected_issue_keys)`) and
+never to the discovered/retrieved count, which is only the bound the selection
+may not exceed. Keeping the two inputs separate is what makes "retrieved N
+issues" impossible to mistake for "processed N issues".
+
+T24 **never truncates**: an oversized selection is refused
+(`IssueLimitStatus.EXCEEDED`). For an accepted selection the caller's own keys
+are echoed back in a fresh tuple, in the caller's own order, so the verdict
+states exactly which issues may enter the pipeline. Truncating would change
+which issues a run processes without the caller deciding it; the caller must
+either select fewer issues or raise the limit deliberately.
+
+`policy_version` is `t24.1`; the module exposes `POLICY_VERSION`,
+`DEFAULT_MAX_ISSUE_LIMIT` (`None`), `MAX_ISSUE_LIMIT` (`1_000_000`),
+`ALLOWED_STATUSES` and `PRECEDENCE`.
+
+### 15.3 Configuration validation (exact behaviour)
+
+`None` means **not configured, and therefore invalid** (option B). It is *not*
+read as "unlimited": an unconfigured safety bound must not widen what a run may
+do, so T24 refuses (`INVALID_CONFIG`) until an operator states an explicit
+number. `DEFAULT_MAX_ISSUE_LIMIT` is `None` for exactly that reason.
+
+| `max_issue_limit` | Usable? | Reason (deterministic) |
+|-------------------|---------|------------------------|
+| `None` | no — `INVALID_CONFIG` | "No max_issue_limit is configured, and an unconfigured limit is not read as unlimited." |
+| `True` / `False` | no — `INVALID_CONFIG` | "max_issue_limit must be a non-negative integer, not bool." |
+| `1.5`, `"3"`, `[]`, any non-integer | no — `INVALID_CONFIG` | "max_issue_limit must be a non-negative integer, not float." (the type name is published, never the value) |
+| `-1`, `-100` | no — `INVALID_CONFIG` | "max_issue_limit must not be negative (got -1)." |
+| `0` | **yes** | validated: the strictest explicit bound — only an empty selection fits |
+| `1` … `1_000_000` | yes | validated |
+| `1_000_001`, `10 ** 9` | no — `INVALID_CONFIG` | "max_issue_limit 1000001 exceeds the supported maximum 1000000." |
+
+A `bool` is checked *before* `int` (`isinstance(value, bool) or not
+isinstance(value, int)`), so Python's `bool`-is-`int` behaviour can never let
+`True` mean "one issue". Exactly the same rule is used for every count in this
+module and for T25's iteration numbers.
+
+### 15.4 Selection validation (exact behaviour)
+
+| Field | Usable? | Reason |
+|-------|---------|--------|
+| `discovered_issue_count=None` | no — `INVALID_DISCOVERED_COUNT` | "No discovered_issue_count was supplied, so the selection cannot be shown to be a subset of what was retrieved." |
+| `True`/`False`, `1.5`, `"5"` | no — `INVALID_DISCOVERED_COUNT` | "discovered_issue_count must be a non-negative integer, not str." |
+| negative | no — `INVALID_DISCOVERED_COUNT` | "discovered_issue_count must not be negative (got -3)." |
+| `0`, any positive integer | yes | validated (counts are never capped: only the *limit* is a policy knob) |
+| `selected_issue_keys` a `set`/`frozenset`/`dict`/`str`/`bytes`/iterator | no — `INVALID_SELECTION` | "selected_issue_keys must be an ordered sequence of issue keys, not set: a set, mapping, string or iterator has no deterministic order." |
+| `selected_issue_keys` a list/tuple with a non-string or empty entry | no — `INVALID_SELECTION` | "Every selected issue key must be a non-empty string: the selection carries an entry of another kind." |
+| a repeated key | no — `DUPLICATE_ISSUES` | "The selection repeats an issue key, so its count would not describe distinct issues." |
+| a list/tuple of non-empty strings, each key once | yes | validated, in the caller's order (key *shape* is not validated here: identity belongs to T22/T23) |
+
+An unordered collection is refused because T24 must preserve an order it cannot
+invent; nothing in this module sorts, deduplicates or ranks.
+
+### 15.5 Decision model (statuses, precedence and the state machine)
+
+T24 has no multi-stage state machine: one call walks a fixed ladder of eight
+checks and stops at the first one whose condition holds. That order is
+`PRECEDENCE`, and it is the authoritative contract:
+
+| # | Status | Condition | Decision |
+|---|--------|-----------|----------|
+| 1 | `INVALID_CONFIG` | the policy states no usable bound | `REFUSE` |
+| 2 | `INVALID_DISCOVERED_COUNT` | the discovered count is unusable | `REFUSE` |
+| 3 | `INVALID_SELECTION` | the keys are not an ordered sequence of non-empty strings | `REFUSE` |
+| 4 | `DUPLICATE_ISSUES` | a key appears twice | `REFUSE` |
+| 5 | `IMPOSSIBLE_COUNTS` | `selected_issue_count > discovered_issue_count` | `REFUSE` |
+| 6 | `EXCEEDED` | `selected_issue_count > max_issue_limit` | `REFUSE` |
+| 7 | `AT_LIMIT` | `selected_issue_count == max_issue_limit` | `ALLOW` |
+| 8 | `WITHIN_LIMIT` | `selected_issue_count < max_issue_limit` | `ALLOW` |
+
+`ALLOWED_STATUSES` is exactly `(AT_LIMIT, WITHIN_LIMIT)`; every other status is
+`REFUSE`, and a configuration that cannot bound anything is refused *before* any
+evidence is considered. When several conditions hold at once the earliest row
+decides: an invalid policy wins over an invalid selection, an unordered
+selection wins over a repeated key (which cannot even be read), a repeated key
+wins over an impossible pair of counts, and impossible counts win over the limit.
+
+### 15.6 Edge cases (all pinned by tests)
+
+* **Empty selection** — accepted by every valid policy, including
+  `max_issue_limit=0`: `accepted_issue_count` is `0` and
+  `remaining_issue_slots == max_issue_limit`.
+* **Zero limit** — valid and strict. With `max_issue_limit=0` the empty
+  selection is `AT_LIMIT` and *any* non-empty selection is `EXCEEDED`; issues can
+  never pass a zero bound.
+* **Limit exactly reached** — `AT_LIMIT`: accepted, `remaining_issue_slots == 0`
+  and `can_accept_more is False`, so an orchestrator knows the pipeline is full.
+* **Selection above the limit** — `EXCEEDED`, `accepted_issue_count == 0`,
+  `accepted_issue_keys == ()`, and the trail names the whole selection — a
+  refusal never hides how many issues were offered.
+* **Discovered == selected** — valid (the selection is the whole retrieved set).
+* **Discovered > selected** — valid; the retrieved volume is never counted as
+  processed.
+* **Selected > discovered** — impossible, `IMPOSSIBLE_COUNTS`.
+* **Huge values** — the *limit* is capped at `MAX_ISSUE_LIMIT` (a larger value is
+  a configuration error), while `discovered_issue_count` is uncapped: it is
+  caller-asserted evidence, not a policy knob.
+* **`None`, `bool`, `float`, `str`** — never coerced, never accepted as `0`.
+
+### 15.7 Fail-closed behaviour
+
+An unusable bound, an unusable count, an unusable selection, a repeated key and
+a contradictory pair of counts are all **refusals**: no silent pass, no repair,
+no normalisation (`"3"` is not `3`, `True` is not `1`, `0` is not "the first
+issue", an unordered set is not sorted for convenience). A refusal always carries
+`decision == REFUSE`, `accepted_issue_count == 0`, `accepted_issue_keys == ()`,
+`remaining_issue_slots is None`, `can_accept_more is False` and a decisive
+`reason`, so a caller that ignores the fields still cannot mistake a refusal for
+an acceptance.
+
+A non-DTO argument (`policy=None`, `selection=None`) raises `TypeError` instead:
+that is a programming error, not an evidence problem.
+
+### 15.8 Determinism, ordering and caller safety
+
+* The verdict is a pure function of `(policy, selection)`: no clock, environment
+  value, random source, ordering of a set/dict or module state is read, so
+  re-evaluating the same inputs returns an **equal** record (`==`) and an equal
+  `as_dict()`.
+* The caller's key order is preserved verbatim — `accepted_issue_keys` is
+  `("ZZZ-2", "AAA-1")` for that input, never a sorted copy — and no ranking is
+  invented.
+* The caller's collection is copied into a tuple; it is never mutated, and the
+  returned tuple is never the caller's object.
+* Every record (`IssueLimitPolicy`, `IssueSelection`, `IssueLimitEvaluation`) is a
+  frozen dataclass: assigning a field raises `FrozenInstanceError`, the policy is
+  unchanged after an evaluation, and `evaluate_issue_limit` has exactly two
+  keyword-only parameters, so no third input (a status, an engine, a pipeline
+  object) can influence it.
+
+### 15.9 Serialization and secret safety
+
+`as_dict()` is JSON-safe, deterministic and **counts only** —
+`accepted_issue_keys` is deliberately absent, because a limit decision is about
+*how many* issues may enter the pipeline, not *which* ones. Consequently no
+caller-supplied key (or a secret-looking value that was passed as one) can be
+published by this module, and that is structural rather than a filter:
+
+* the evaluation publishes counts, booleans, the validated bound, the reason and
+  the policy view;
+* an **unusable** policy value is never echoed — `IssueLimitPolicy(max_issue_limit="squ_...").as_dict()`
+  publishes `max_issue_limit: None` and a refusal reason that names the *type*;
+* refusal reasons name counts and type names only, never caller text;
+* `IssueSelection.as_dict()` publishes `discovered_issue_count` (validated) and
+  `selected_issue_key_count`, never the keys.
+
+### 15.10 Output DTO
+
+`IssueLimitEvaluation` carries: `policy_version`, `status`, `decision`,
+`is_allowed`, `limit_exceeded`, `max_issue_limit`, `discovered_issue_count`,
+`selected_issue_count`, `accepted_issue_count`, `accepted_issue_keys`,
+`remaining_issue_slots`, `can_accept_more`, `reason`, `reasons` and `policy`
+(the configuration, so the verdict explains itself). Derived fields
+(`is_allowed`, `limit_exceeded`) are properties, so they can never disagree with
+`status`.
+
+```json
+{
+  "policy_version": "t24.1",
+  "status": "at-limit",
+  "decision": "allow",
+  "is_allowed": true,
+  "limit_exceeded": false,
+  "max_issue_limit": 2,
+  "discovered_issue_count": 7,
+  "selected_issue_count": 2,
+  "accepted_issue_count": 2,
+  "remaining_issue_slots": 0,
+  "can_accept_more": false,
+  "reason": "The selection of 2 issue(s) exactly reaches the limit of 2 issue(s), so no further issue may be added.",
+  "reasons": [
+    "The selection of 2 issue(s) exactly reaches the limit of 2 issue(s), so no further issue may be added.",
+    "The pipeline is full: T24 never accepts more than the configured bound."
+  ],
+  "policy": {
+    "policy_version": "t24.1",
+    "max_issue_limit": 2,
+    "maximum_supported_limit": 1000000,
+    "is_valid": true,
+    "refusal_reason": null
+  }
+}
+```
+
+### 15.11 Safety guarantees
+
+1. `accepted_issue_count <= max_issue_limit` for **every** accepted selection
+   (pinned by a sweep over limits, counts and selection sizes).
+2. A zero limit never lets an issue through.
+3. A negative, `None`, bool, float, string or oversized limit is refused.
+4. Invalid configuration fails closed even for an empty selection.
+5. A missing configuration follows the documented safe policy: refuse.
+6. `bool` is never silently accepted as an integer.
+7. The discovered count can never be mistaken for the selected count.
+8. Impossible counts (`selected > discovered`) are rejected.
+9. Serialization is deterministic and JSON-safe.
+10. The caller's collection is never mutated and never reordered.
+11. No network, Git, SonarQube, Codex, subprocess or filesystem operation exists
+    in the module (asserted by an AST inspection of its own source).
+12. No caller-supplied value (or secret) is ever serialized.
+
+### 15.12 Examples
+
+A future orchestrator holds the numbers `main.py` already produces today
+(`total` and the T03/T04-selected issues) and asks once per run:
+
+```python
+>>> from issue_limit import (IssueLimitPolicy, IssueSelection,
+...                          evaluate_issue_limit)
+>>> decision = evaluate_issue_limit(
+...     policy=IssueLimitPolicy(max_issue_limit=2),
+...     selection=IssueSelection(discovered_issue_count=7,
+...                              selected_issue_keys=("P:1", "P:2")),
+... )
+>>> decision.status
+<IssueLimitStatus.AT_LIMIT: 'at-limit'>
+>>> decision.is_allowed, decision.accepted_issue_keys
+(True, ('P:1', 'P:2'))
+>>> evaluate_issue_limit(
+...     policy=IssueLimitPolicy(max_issue_limit=2),
+...     selection=IssueSelection(discovered_issue_count=7,
+...                              selected_issue_keys=("P:1", "P:2", "P:3")),
+... ).reason
+'The selection of 3 issue(s) exceeds the limit of 2 issue(s), so the run is refused.'
+>>> evaluate_issue_limit(
+...     policy=IssueLimitPolicy(),
+...     selection=IssueSelection(discovered_issue_count=7,
+...                              selected_issue_keys=("P:1",)),
+... ).status
+<IssueLimitStatus.INVALID_CONFIG: 'invalid-config'>
+>>> evaluate_issue_limit(
+...     policy=IssueLimitPolicy(max_issue_limit=1),
+...     selection=IssueSelection(discovered_issue_count=7,
+...                              selected_issue_keys=["P:1", "P:2"]),
+... ).status
+<IssueLimitStatus.EXCEEDED: 'exceeded'>
+>>> evaluate_issue_limit(
+...     policy=IssueLimitPolicy(max_issue_limit=1),
+...     selection=IssueSelection(discovered_issue_count=7,
+...                              selected_issue_keys={"P:1", "P:2"}),
+... ).status
+<IssueLimitStatus.INVALID_SELECTION: 'invalid-selection'>
+```
+
+### 15.13 Test mapping
+
+| Test file | Covers |
+|-----------|--------|
+| `tests/test_issue_limit.py` | configuration validation (usable bounds, `0`, negative, `None`, bool, float, string, oversized, default), selection validation (unusable discovered counts, set/mapping/bare-string/iterator selections, non-text keys, repeated keys, impossible counts), the acceptance rule (below/at/above the limit, `limit=1`, zero limit, empty selection, a sweep proving `accepted <= limit`), the discovered-vs-selected confusion cases, the capped limit versus the uncapped counts, the exact `PRECEDENCE` and one conflict per row, status reachability and the `ALLOWED_STATUSES` <=> `ALLOW` equivalence, determinism, ordering, caller-collection safety, immutability, canonical JSON serialization, secret safety (a decoy secret can never be published), the helper tables, and the module surface (exact `__all__`, standard-library-only imports, no execution primitive, exactly two keyword-only parameters) |
+
+### 15.14 Integration status
+
+* **T24 is a library with no caller.** `main.py` is byte-for-byte unchanged and
+  no production path imports `issue_limit`.
+* The module imports the standard library only (`dataclasses`, `enum`, `typing`)
+  and has no dependency on T19–T23, so nothing about the existing pipeline can
+  change because of it.
+* T24 is a limit/policy boundary only: it is **not** orchestration, and it
+  executes no Git/SonarQube/Codex operation.
+
+### 15.15 Acceptance criteria
+
+1. **Given** a configured positive limit and a selection at or below it, **when**
+   `evaluate_issue_limit` is called, **then** the verdict is `ALLOW` with
+   `accepted_issue_keys` equal to the caller's keys in the caller's order.
+2. **Given** a selection larger than the limit, **then** the verdict is
+   `EXCEEDED` and the selection is refused — never truncated.
+3. **Given** `None`, a bool, a float, a string, a negative or an oversized
+   limit, **then** the verdict is `INVALID_CONFIG` (fail closed) whatever the
+   selection is.
+4. **Given** an unordered, non-text, repeated or self-contradictory selection,
+   **then** the verdict is `INVALID_SELECTION`, `DUPLICATE_ISSUES` or
+   `IMPOSSIBLE_COUNTS` respectively.
+5. **Given** identical inputs, **then** the verdict, its `as_dict()` and the
+   caller's collection are byte-for-byte identical after the call.
+
+## 16. T25 — max iteration limit (implemented policy layer, not wired)
+
+T25 answers exactly one question and nothing else:
+
+> "may the caller execute this iteration of this issue's fix attempt?"
+
+It is a **pure policy / validation layer**: it owns no counter, runs nothing,
+retries nothing, and performs no Git, SonarQube, Codex, subprocess, network or
+filesystem operation. `main.py` is byte-for-byte unchanged and **nothing calls
+T25 yet**.
+
+| Module | Role | Side effects |
+|--------|------|--------------|
+| `iteration_limit.py` | the immutable policy / attempt / verdict records, the validation, the decision ladder and `as_dict()` | **none** |
+
+### 16.1 Purpose, scope and non-goals
+
+* **Purpose**: prevent one SonarQube issue from entering an unbounded AI-fix
+  retry loop, by answering "may this attempt run?" deterministically.
+* **In scope**: configuration validation, attempt validation, the exact
+  eligibility rule, the deterministic order of the checks and the exact reason.
+* **Out of scope**: executing Codex (T10), interpreting its result (T11),
+  classifying an attempt (T19), deciding *whether* to retry (no orchestration),
+  counting attempts (the caller owns the counter) and reporting (T22/T23).
+* **Trust boundary**: both inputs are **caller-asserted**. T25 counts nothing and
+  authenticates nothing: a caller that misreports which iteration it is on is not
+  detected here. This is a policy boundary, not an evidence-authentication
+  boundary.
+
+### 16.2 The contract
+
+```python
+IterationLimitPolicy(max_iterations=None)                # configuration
+IterationAttempt(current_iteration=None)                 # caller input
+evaluate_iteration_limit(*, policy, attempt) -> IterationLimitEvaluation
+```
+
+`max_iterations` is the maximum number of attempts one issue may receive, so
+
+```
+1 <= current_iteration <= max_iterations    is eligible for execution
+current_iteration > max_iterations          is refused
+```
+
+`policy_version` is `t25.1`; the module exposes `POLICY_VERSION`,
+`DEFAULT_MAX_ITERATIONS` (`None`), `MAX_ITERATIONS` (`1_000`),
+`ALLOWED_STATUSES` and `PRECEDENCE`.
+
+### 16.3 Validation (exact behaviour)
+
+| `max_iterations` | Usable? | Reason |
+|------------------|---------|--------|
+| `None` | no — `INVALID_CONFIG` | "No max_iterations is configured, and an unconfigured retry limit is not read as unlimited." |
+| `True` / `False` | no — `INVALID_CONFIG` | "max_iterations must be a non-negative integer, not bool." |
+| `1.5`, `"3"`, any non-integer | no — `INVALID_CONFIG` | "max_iterations must be a non-negative integer, not float." (type name only) |
+| `-1`, `-100` | no — `INVALID_CONFIG` | "max_iterations must not be negative (got -1)." |
+| `0` | **yes** | validated: the strictest explicit bound — no attempt is ever allowed |
+| `1` … `1_000` | yes | validated |
+| `1_001`, `10 ** 9` | no — `INVALID_CONFIG` | "max_iterations 1001 exceeds the supported maximum 1000." |
+
+`None` again means **not configured, therefore invalid** — the same safe
+interpretation T24 documents (§15.3), so neither limit can ever be read as
+"unlimited". A `bool` is rejected before the `int` check.
+
+| `current_iteration` | Usable? | Reason |
+|---------------------|---------|--------|
+| `None` | no — `INVALID_ITERATION` | "No current_iteration was supplied, so no attempt is authorised." |
+| `True`/`False`, `1.5`, `"1"` | no — `INVALID_ITERATION` | "current_iteration must be an integer of at least 1, not str." |
+| `0`, `-1`, `-5` | no — `INVALID_ITERATION` | "current_iteration 0 is not an attempt: iteration numbers start at 1." |
+| `1`, `2`, … | yes | validated (never capped: a huge attempt number is simply beyond the limit) |
+
+### 16.4 Decision model (statuses, precedence and the exact truth table)
+
+One call walks a fixed ladder of four checks and stops at the first whose
+condition holds — `PRECEDENCE` is the authoritative order:
+
+| # | Status | Condition | Decision |
+|---|--------|-----------|----------|
+| 1 | `INVALID_CONFIG` | the policy states no usable bound | `REFUSE` |
+| 2 | `INVALID_ITERATION` | the attempt number is unusable | `REFUSE` |
+| 3 | `EXCEEDED` | `current_iteration > max_iterations` | `REFUSE` |
+| 4 | `WITHIN_LIMIT` | `current_iteration < max_iterations` | `ALLOW` |
+| 5 | `AT_LIMIT` | `current_iteration == max_iterations` | `ALLOW` |
+
+`ALLOWED_STATUSES` is exactly `(WITHIN_LIMIT, AT_LIMIT)`. Rows 4 and 5 are
+mutually exclusive, so five statuses cover the whole domain. The verdict's flags
+are derived, so they cannot contradict the status:
+
+| Case | `status` | `decision` | `attempt_allowed` | `next_iteration_allowed` | `limit_reached` | `remaining_iterations` |
+|------|----------|-----------|-------------------|--------------------------|-----------------|------------------------|
+| `max=2, current=1` | `WITHIN_LIMIT` | `ALLOW` | `True` | `True` | `False` | `1` |
+| `max=2, current=2` | `AT_LIMIT` | `ALLOW` | `True` | `False` | `True` | `0` |
+| `max=2, current=3` | `EXCEEDED` | `REFUSE` | `False` | `False` | `True` | `0` |
+| `max=1, current=1` | `AT_LIMIT` | `ALLOW` | `True` | `False` | `True` | `0` |
+| `max=1, current=2` | `EXCEEDED` | `REFUSE` | `False` | `False` | `True` | `0` |
+| `max=0, current=1` | `EXCEEDED` | `REFUSE` | `False` | `False` | `True` | `0` |
+| `max=3, current=0` | `INVALID_ITERATION` | `REFUSE` | `False` | `False` | `False` | `None` |
+| `max=None, current=1` | `INVALID_CONFIG` | `REFUSE` | `False` | `False` | `False` | `None` |
+
+`next_iteration_allowed` is exactly `attempt_allowed` for
+`current_iteration + 1`, which the tests assert for every boundary, so
+"may I loop again?" has one unambiguous answer.
+
+### 16.5 Edge cases (all pinned by tests)
+
+* **`max_iterations = 1`** — attempt 1 is `AT_LIMIT` (allowed) and attempt 2 is
+  `EXCEEDED`. No off-by-one.
+* **`max_iterations = 2`** — attempts 1 and 2 are allowed, attempt 3 is refused.
+* **`max_iterations = 0`** — valid and strict: *no* attempt is ever allowed, and
+  every attempt number `>= 1` is `EXCEEDED`.
+* **`current_iteration = 0` or negative** — refused as "not an attempt", never
+  normalised to attempt 1 and never silently reset to 0 progress.
+* **`current_iteration > max_iterations`** — refused, and it stays refused however
+  many times it is asked.
+* **A huge `current_iteration`** — refused (`EXCEEDED`); the attempt number is
+  caller-asserted evidence, so it is not capped.
+* **`None`, `bool`, `float`, `str`** — never coerced, never accepted as `0`.
+
+### 16.6 Retry safety (the guarantees this module exists for)
+
+* **Reaching the limit prevents another attempt** — `max_iterations + 1` is
+  `EXCEEDED`, permanently.
+* **Failures never reset the counter** — `TESTS_FAILED`, `ANALYSIS_FAILED`,
+  `CODEX_FAILED`, `STILL_OPEN` and `REVIEW_REQUIRED` carry no power here: T25
+  imports no status vocabulary, has no parameter for an outcome, and refuses any
+  value that could not be an attempt number.
+* **A success does not raise the limit** — `max_iterations` is a frozen field and
+  the verdict never writes to it, so attempt 3 stays refused after a successful
+  attempt 2.
+* **The policy cannot be bypassed by passing a different status** — there is no
+  status input at all (`evaluate_iteration_limit(*, policy, attempt)` has exactly
+  two keyword-only parameters), and the tests sweep every T19/T20/T21 status
+  value proving that none of them is accepted as a bound or as an iteration.
+* **No automatic reset, no implicit retry, no hidden increment** — the module
+  exposes no `advance()`/`next()`/`reset()`/`increment()`, keeps no state between
+  calls, and the counter is the caller's; T25 only judges the value it is given.
+
+### 16.7 Fail-closed, determinism and secret safety
+
+* An unusable bound or attempt is a **refusal**: no silent pass, no repair, no
+  normalisation (`"1"` is not `1`, `True` is not `1`, `0` is not the first
+  attempt). A refusal always carries `decision == REFUSE`, `attempt_allowed is
+  False`, `next_iteration_allowed is False`, `remaining_iterations is None` and a
+  decisive `reason`.
+* A non-DTO argument raises `TypeError` (a programming error, not evidence).
+* The verdict is a pure function of `(policy, attempt)`: no clock, environment
+  value, random source or module state is read, the same inputs always produce an
+  equal record (`==`) and an equal `as_dict()`, and repeated evaluation after any
+  number of refusals changes nothing.
+* `as_dict()` is JSON-safe and secret-free: it publishes the validated integers,
+  the enums, the derived flags, the reason trail and the policy view. An unusable
+  value is described by its **type name** only (never echoed), so no
+  caller-authored text — and no secret passed where a number belonged — can be
+  serialized by this module.
+
+### 16.8 Output DTO
+
+`IterationLimitEvaluation` carries: `policy_version`, `status`, `decision`,
+`is_allowed`, `attempt_allowed`, `next_iteration_allowed`, `limit_reached`,
+`max_iterations`, `current_iteration`, `remaining_iterations`, `reason`,
+`reasons` and `policy`. `attempt_allowed` **is** `decision == ALLOW` and
+`is_allowed` is its property alias, so a caller cannot read them as disagreeing.
+
+### 16.9 Examples
+
+```python
+>>> from iteration_limit import (IterationAttempt, IterationLimitPolicy,
+...                              evaluate_iteration_limit)
+>>> evaluate_iteration_limit(
+...     policy=IterationLimitPolicy(max_iterations=2),
+...     attempt=IterationAttempt(current_iteration=1),
+... ).status
+<IterationLimitStatus.WITHIN_LIMIT: 'within-limit'>
+>>> evaluate_iteration_limit(
+...     policy=IterationLimitPolicy(max_iterations=2),
+...     attempt=IterationAttempt(current_iteration=2),
+... ).status
+<IterationLimitStatus.AT_LIMIT: 'at-limit'>
+>>> evaluate_iteration_limit(
+...     policy=IterationLimitPolicy(max_iterations=2),
+...     attempt=IterationAttempt(current_iteration=3),
+... ).reason
+'Iteration 3 exceeds the limit of 2 permitted iteration(s), so it is refused.'
+>>> evaluate_iteration_limit(
+...     policy=IterationLimitPolicy(max_iterations=1),
+...     attempt=IterationAttempt(current_iteration=2),
+... ).status
+<IterationLimitStatus.EXCEEDED: 'exceeded'>
+>>> evaluate_iteration_limit(
+...     policy=IterationLimitPolicy(max_iterations=3),
+...     attempt=IterationAttempt(current_iteration=0),
+... ).status
+<IterationLimitStatus.INVALID_ITERATION: 'invalid-iteration'>
+>>> evaluate_iteration_limit(
+...     policy=IterationLimitPolicy(),
+...     attempt=IterationAttempt(current_iteration=1),
+... ).status
+<IterationLimitStatus.INVALID_CONFIG: 'invalid-config'>
+>>> evaluate_iteration_limit(
+...     policy=IterationLimitPolicy(max_iterations=2),
+...     attempt=IterationAttempt(current_iteration=1),
+... ).as_dict()["next_iteration_allowed"]
+True
+```
+
+### 16.10 Test mapping
+
+| Test file | Covers |
+|-----------|--------|
+| `tests/test_iteration_limit.py` | configuration validation (usable bounds, `0`, negative, `None`, bool, float, string, oversized, default), attempt validation (`None`, `0`, negative, bool, float, string), the exact boundary semantics for `max=1`/`max=2`, the full truth table of `attempt_allowed`/`next_iteration_allowed`/`limit_reached`/`remaining_iterations`, the `next_iteration_allowed == attempt(next)` invariant, the zero bound, huge attempt numbers, the exact `PRECEDENCE` and one conflict per row, status reachability, the retry guarantees (a scripted retry loop, a success that cannot raise the limit, repeated refusals, a sweep over **every** T19/T20/T21 status value proving none is accepted as a bound or an iteration), determinism, immutability, no counter/advance API, canonical JSON serialization, secret safety, the helper tables, and the module surface (exact `__all__`, standard-library-only imports with no status vocabulary, no execution primitive, exactly two keyword-only parameters) |
+
+### 16.11 Integration status
+
+* **T25 is a library with no caller.** `main.py` is byte-for-byte unchanged and
+  no production path imports `iteration_limit`.
+* The module imports the standard library only (`dataclasses`, `enum`, `typing`),
+  so it is independent of T19's implementation and cannot change any existing
+  behaviour. T19 remains the stage that *classifies* one attempt; T25 only
+  answers whether a further attempt may start.
+* T25 is a limit/policy boundary only: it is **not** orchestration, it does not
+  re-invoke Codex, and it executes no Git/SonarQube/Codex operation.
+
+### 16.12 Acceptance criteria
+
+1. **Given** a configured bound and an attempt within it, **when**
+   `evaluate_iteration_limit` is called, **then** `attempt_allowed is True` (and
+   `AT_LIMIT` when it is the last attempt).
+2. **Given** `current_iteration > max_iterations`, **then** the verdict is
+   `EXCEEDED` however many times it is asked, with no counter mutation.
+3. **Given** `None`, a bool, a float, a string, a negative or an oversized bound,
+   **then** the verdict is `INVALID_CONFIG` for every attempt.
+4. **Given** `None`, a bool, a float, a string, `0` or a negative attempt number,
+   **then** the verdict is `INVALID_ITERATION` and the value is never normalised.
+5. **Given** any T19/T20/T21 status value, **then** it can neither authorise an
+   attempt beyond the limit nor be accepted as a bound or an iteration.
+6. **Given** identical inputs, **then** the verdict is equal, its `as_dict()` is
+   byte-for-byte identical and neither input record changed.
+
+## 17. T24/T25 at a glance (both implemented; neither is wired)
+
+* `issue_limit.py` (T24, `t24.1`) bounds **how many issues** one run may process;
+  `iteration_limit.py` (T25, `t25.1`) bounds **how many attempts** one issue may
+  receive. Both are pure: standard library only, frozen records, no I/O, no
+  execution, no orchestration.
+* Both take their values from the caller and validate *internal consistency and
+  safety* only — neither authenticates anything (§15.1, §16.1).
+* Both fail closed on `None`: an unconfigured limit is never "unlimited".
+* Both refuse `bool`/`float`/`str`, never normalise an invalid value, and never
+  echo caller-authored text in a reason or a serialized view.
+* Neither is imported by `main.py`, T19–T23, or by the other one: T24 and T25 are
+  independent, and `RunContext`/orchestration remain deferred.
 
