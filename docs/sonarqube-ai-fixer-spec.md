@@ -1,11 +1,12 @@
-# SonarQube AI Auto-Fixer — Domain & Behaviour Specification (T04–T26)
+# SonarQube AI Auto-Fixer — Domain & Behaviour Specification (T04–T27)
 
 Status: **POC implementation complete (T01–T26)** · T20 (safe, fail-closed,
 exactly-one-commit Git commit), T21 (safe, fail-closed, exactly-one-push Git
 push of a T20 `COMMITTED` result), T22/T23 (the overall and per-issue reports),
-T24/T25 (the max-issue / max-iteration policy limits) and T26 (the standalone
-main/default branch-protection policy, §18) are implemented; none of them is
-wired into `main.py`, and T27+ is deliberately not implemented · No
+T24/T25 (the max-issue / max-iteration policy limits), T26 (the standalone
+main/default branch-protection policy, §18) and T27 (the standalone fail-closed
+uncertainty policy, §19) are implemented; none of them is
+wired into `main.py`, and T28+ is deliberately not implemented · No
 real SonarQube credentials and no real push are ever made by this tool (every
 T21 push targets a bare repository under `tmp_path`) · Tests never invoke a real
 Codex CLI, never need a real project toolchain, never need a live SonarQube
@@ -39,12 +40,14 @@ fix one SonarQube issue in a **local clone** of the analysed repository:
 16. classifies the attempt as `FIXED`, `STILL_OPEN`, `ANALYSIS_FAILED`,
     `TESTS_FAILED`, `SCOPE_INVALID`, `CODEX_FAILED` or `REVIEW_REQUIRED` (T19).
 
-T20–T26 (commits §11, pushes §12, reporting §13–§14, the two policy limits
-§15–§16 and branch protection §18) are implemented and documented below. PR
+T20–T27 (commits §11, pushes §12, reporting §13–§14, the two policy limits
+§15–§16, branch protection §18 and the uncertainty policy §19) are implemented
+and documented below. PR
 creation, retry/iteration **loops**, orchestration, branch/rule *enforcement*
 and container/CI wiring remain **out of scope** for this document and for the
-codebase — T26 decides whether a branch is safe to mutate but nothing enforces
-that decision yet, and it never touches Git. T16–T19 deliberately
+codebase — T26 decides whether a branch is safe to mutate and T27 decides
+whether the evidence authorises the mutation, but nothing enforces either
+decision yet, and neither of them touches Git. T16–T19 deliberately
 stop at *verifying and classifying* the attempt: nothing is committed, nothing
 is pushed, nothing is retried, no SonarQube issue is resolved or closed, and no
 source code is modified by these stages.
@@ -77,8 +80,8 @@ source code is modified by these stages.
 | — | Pre-T20 safety primitive: secret scan of a future commit's content | `secret_scan.py` | ✔ (primitive only, no commit) |
 | T20 | Safe, fail-closed, exactly-one-commit Git commit of a verified fix | `commit_message.py`, `commit_policy.py`, `git_commit.py` | ✔ |
 | T21 | Safe, fail-closed, exactly-one-push Git push of a T20 `COMMITTED` result | `push_policy.py`, `git_push.py` | ✔ |
-| T22–T26 | Reporting (§13–§14), the two policy limits (§15–§16) and branch protection (§18) | `overall_report.py`, `per_issue_report.py`, `issue_limit.py`, `iteration_limit.py`, `branch_protection.py` | ✔ (none wired) |
-| T27+ | PRs, retry loops, orchestration, CI, containers | — | ✖ not implemented |
+| T22–T27 | Reporting (§13–§14), the two policy limits (§15–§16), branch protection (§18) and the uncertainty policy (§19) | `overall_report.py`, `per_issue_report.py`, `issue_limit.py`, `iteration_limit.py`, `branch_protection.py`, `uncertainty_policy.py` | ✔ (none wired) |
+| T28+ | PRs, retry loops, orchestration, CI, containers | — | ✖ not implemented |
 
 ## 3. Actors and system context
 
@@ -3257,4 +3260,393 @@ reports 100% for both modules.
    byte-for-byte identical and no caller value (policy, input, list) changed.
 9. **Given** any inputs, **then** the policy performs no I/O, no Git operation
    and no branch mutation, and constructs no command.
+
+## 19. T27 — uncertainty policy (implemented policy layer, not wired)
+
+T27 answers exactly one question and nothing else:
+
+> "is the evidence that is supposed to authorise this mutation *explicitly
+> confirmed*?"
+
+It is a **pure policy / decision layer**: it discovers nothing, runs no Git
+command, reads no file, queries no SonarQube, executes no Codex, authenticates
+nothing and mutates nothing. `main.py` is byte-for-byte unchanged, T19–T26 keep
+their own (unchanged) logic, and **nothing calls T27 yet**.
+
+| Module | Role | Side effects |
+|--------|------|--------------|
+| `uncertainty_policy.py` | the fixed required-evidence policy, the immutable input/verdict records, the state→status mapping, the decision ladder and `as_dict()` | **none** |
+
+`POLICY_VERSION` is `t27.1`. The module exposes `POLICY_VERSION`,
+`ALLOWED_STATUSES`, `REVIEW_STATUSES`, `PRECEDENCE`, `REQUIRED_DIMENSIONS`,
+`CONTRADICTION_PAIRS`, `EvidenceState`, `EvidenceDimension`, `MutationPhase`,
+`UncertaintyStatus`, `UncertaintyDecision`, `EvidenceItem`,
+`UncertaintyInput`, `UncertaintyEvaluation` and `evaluate_uncertainty` — and it
+imports the standard library only (`__future__`, `dataclasses`, `enum`,
+`types`, `typing`), not a single module of this repository.
+
+### 19.1 Purpose, scope and non-goals
+
+* **Purpose**: give a future orchestration layer one deterministic, fail-closed
+  answer to "does the evidence authorise this commit/push?", so partial, absent,
+  stale or contradictory evidence can never be read as permission.
+* **In scope**: the fixed required-evidence policy per phase, evidence-record
+  validation, the state→status mapping, the decision order, contradiction
+  detection, the exact reason and the canonical serialization.
+* **Out of scope**: gathering evidence (T10–T19 produce it, T20/T21 add to it),
+  reading Git (T12/T20/T21), branch creation (T07), branch protection (T26,
+  §18), committing (T20, §11), pushing (T21, §12), retrying/looping,
+  orchestration and `RunContext`.
+* **Trust boundary**: the input record is **caller-asserted**; T27 authenticates
+  nothing and proves nothing (§19.10).
+
+### 19.2 The one rule and the four phases
+
+A mutation is allowed **only** when every dimension the phase requires is
+`CONFIRMED`. There is no weighting, no scoring, no threshold, no confidence
+value and no "probably fine" path: any other state refuses the mutation. Every
+phase requires everything the earlier phases required, so the policy can only
+ever get stricter as a run advances.
+
+| Phase | Asked before | Requires |
+|-------|--------------|----------|
+| `PRE_COMMIT` | the T20 commit | the pre-commit evidence (9 dimensions) |
+| `POST_COMMIT` | the T21 push, with the commit re-verified | pre-commit + commit evidence (12) |
+| `PRE_PUSH` | the T21 push, with the branch re-verified | post-commit + branch consistency (13) |
+| `POST_PUSH` | ending the run, with the push verified | pre-push + push evidence (16) |
+
+### 19.3 The evidence model (states and dimensions)
+
+Evidence is **explicit and typed**. The caller states one `EvidenceItem` — a
+`dimension` plus an `EvidenceState` — per dimension it knows about, and a
+dimension it omits is `MISSING`, never assumed confirmed.
+
+| State | Meaning |
+|-------|---------|
+| `CONFIRMED` | the dimension is explicitly, positively established |
+| `MISSING` | the dimension was not supplied at all |
+| `UNVERIFIED` | the dimension was reported but not verified |
+| `UNKNOWN` | the dimension was not established |
+| `AMBIGUOUS` | the dimension is ambiguous |
+| `NEGATIVE` | the dimension is a *known* negative result, not merely uncertain |
+| `CONTRADICTORY` | the dimension contradicts itself or the claim that depends on it |
+| `INVALID` | the stated value is not usable at all |
+
+| Dimension | Where it comes from | `CONFIRMED` means |
+|-----------|---------------------|-------------------|
+| `issue-outcome` | T19 | the verified fix is `FIXED` |
+| `codex-execution` | T10/T11 | Codex ran and its result is analysable |
+| `change-scope` | T13 | the diff stayed inside the issue's scope |
+| `tests` | T14/T15 | the project test run passed |
+| `sonar-analysis` | T16/T17 | the re-analysis completed |
+| `issue-verification` | T18 | the original issue is reliably absent |
+| `analysis-correlation` | T17→T18 | the snapshot is attributable to the waited-on analysis |
+| `cross-stage-consistency` | T19/T20/T21 | the lifecycle stages agree with one another |
+| `branch-protection` | T26 | the branch was `ALLOWED` |
+| `commit-result` | T20 | the commit was created (`COMMITTED`) |
+| `commit-identity` | T20 | the recorded commit is the one that was created |
+| `commit-repository` | T20 | the repository state after the commit is expected |
+| `branch-consistency` | T20/T21 | source and destination branch agree |
+| `push-result` | T21 | the push was created (`PUSHED`) |
+| `remote-tip` | T21 | the remote tip is the expected one |
+| `expected-commit` | T21 | the pushed commit is the expected one |
+
+Everything else maps to a non-confirming state. T19's known failures
+(`STILL_OPEN`, `TESTS_FAILED`, `SCOPE_INVALID`, `CODEX_FAILED`,
+`ANALYSIS_FAILED`) are `NEGATIVE`; T19's `REVIEW_REQUIRED`, a T17 timeout and an
+unattributable T18 snapshot are `UNKNOWN`/`UNVERIFIED` (doubt); a T26 `REFUSE` is
+`NEGATIVE` while a T26 that was never evaluated is `UNKNOWN`. T27 does **not**
+encode that mapping: it owns no T19–T26 constant, imports none of them (§19.13)
+and accepts any of the eight states for any dimension, so the mapping is
+documentation for the future integration rather than a T27 dependency.
+
+Each `EvidenceItem` may additionally carry a `code`: a bounded machine token
+(letters, digits and `-`, `_`, `.`, `:`; at most 48 characters) that names the
+*source* condition — `still-open` or `sha-mismatch`, for example. A code is
+echoed for diagnostics and is **never consulted**: a test pins that two inputs
+differing only in a code produce byte-identical status, decision, blocking
+dimension and reason. No free-form message is accepted anywhere, and a code that
+is not a bounded token makes the whole record unusable instead of being trimmed.
+
+### 19.4 The required-evidence policy (fixed, not configurable)
+
+| Phase | Required dimensions, in policy order |
+|-------|--------------------------------------|
+| `PRE_COMMIT` | `issue-outcome`, `codex-execution`, `change-scope`, `tests`, `sonar-analysis`, `issue-verification`, `analysis-correlation`, `cross-stage-consistency`, `branch-protection` |
+| `POST_COMMIT` | pre-commit + `commit-result`, `commit-identity`, `commit-repository` |
+| `PRE_PUSH` | post-commit + `branch-consistency` |
+| `POST_PUSH` | pre-push + `push-result`, `remote-tip`, `expected-commit` |
+
+`REQUIRED_DIMENSIONS` is a **read-only** mapping (`types.MappingProxyType`), and
+there is no constructor, flag or keyword that can shorten a phase, so the
+contract cannot be weakened by a caller (a test pins the `TypeError` a mutation
+raises). A dimension a phase does **not** require is ignored rather than
+trusted: it can neither soften nor harden that phase's verdict, which is what
+lets a caller accumulate evidence across a run and simply ask the phase it is
+about to reach.
+
+The single exception is `INVALID`: an unusable state *anywhere* in the record
+refuses the whole record (`INVALID_INPUT`), because a record that contains
+something T27 cannot read is not trustworthy at all — even when the unusable
+dimension is one the phase does not require.
+
+### 19.5 Statuses
+
+| Status | Meaning |
+|--------|---------|
+| `ALLOWED` | every required dimension is confirmed |
+| `INVALID_POLICY` | the phase does not select a mutation phase T27 knows |
+| `INVALID_INPUT` | the evidence record itself is not usable |
+| `MISSING_EVIDENCE` | a required dimension was not supplied (absence) |
+| `CONTRADICTORY_EVIDENCE` | a required dimension contradicts itself or its claim |
+| `NEGATIVE_EVIDENCE` | a required dimension is a *known* negative result |
+| `UNKNOWN_EVIDENCE` | a required dimension was not established (doubt) |
+| `UNVERIFIED_EVIDENCE` | a required dimension was reported but not verified (doubt) |
+| `AMBIGUOUS_EVIDENCE` | a required dimension is ambiguous (doubt) |
+
+`UncertaintyDecision` is `ALLOW` only for `ALLOWED_STATUSES` (`(ALLOWED,)`) and
+`REFUSE` for every other status, and `UncertaintyEvaluation.is_allowed` is
+derived from the decision and never stored separately — so a refusal can never
+report `is_allowed == True` and an allowed verdict can never carry a refusal
+status. `REVIEW_STATUSES` is `(MISSING_EVIDENCE, UNKNOWN_EVIDENCE,
+UNVERIFIED_EVIDENCE, AMBIGUOUS_EVIDENCE)`; `requires_review` is True only for
+those, and it never changes the decision.
+
+### 19.6 Precedence (explicit, documented and pinned)
+
+`PRECEDENCE` is the authoritative order; the first applicable status decides, and
+the blocking dimension is the first *required* dimension, in the phase's policy
+order, that carries the decisive state (a test reverses the caller's tuple and
+pins that the reported dimension does not move):
+
+1. `INVALID_POLICY` — a phase that selects no policy refuses before anything else;
+2. `INVALID_INPUT` — a record that cannot be read refuses before any judgement;
+3. `MISSING_EVIDENCE` — absence is reported before any state of the evidence that
+   *was* supplied;
+4. `CONTRADICTORY_EVIDENCE` — an explicit contradiction first, then a confirmed
+   claim whose required proof is present but not confirmed;
+5. `NEGATIVE_EVIDENCE` — a known failure;
+6. `UNKNOWN_EVIDENCE`;
+7. `UNVERIFIED_EVIDENCE`;
+8. `AMBIGUOUS_EVIDENCE`;
+9. `ALLOWED`.
+
+**The documented hard cases**, each pinned by a test:
+
+* `PRE_COMMIT` with `commit-identity` unverified and `commit-result` absent is
+  `MISSING_EVIDENCE`, **not** `CONTRADICTORY_EVIDENCE`: a missing dimension is a
+  gap in the call, and absence is reported first.
+* `POST_COMMIT` with `commit-result` confirmed and `commit-identity` unknown is
+  `CONTRADICTORY_EVIDENCE`, **not** `UNKNOWN_EVIDENCE`: a present-but-
+  unconfirmed proof contradicts the confirmed claim that depends on it. The
+  proof's own state (`unknown`) is still reported in `blocking_state`, so the
+  diagnosis stays precise.
+* `PRE_COMMIT` with the whole commit evidence supplied but not required is
+  `ALLOWED`: a contradiction is only checked between dimensions the phase
+  actually requires.
+
+The tests pin one conflict per adjacent pair: invalid policy beats invalid input;
+invalid input beats missing evidence; missing evidence beats both contradiction
+and negative evidence; contradiction beats negative and unknown evidence;
+negative beats unknown and unverified evidence; unknown beats unverified;
+unverified beats ambiguous; ambiguous beats allowed.
+
+### 19.7 Contradiction detection
+
+Contradictions are refused, never resolved optimistically. T27 reports
+`CONTRADICTORY_EVIDENCE` when
+
+* a required dimension is explicitly `CONTRADICTORY`, or
+* a **confirmed** claim is paired with a required proof that is *present but not
+  confirmed* (`CONTRADICTION_PAIRS`): `issue-outcome`/`issue-verification`,
+  `issue-outcome`/`analysis-correlation`, `commit-result`/`commit-identity`,
+  `commit-result`/`commit-repository`, `push-result`/`remote-tip` and
+  `push-result`/`expected-commit`. The pair is only evaluated in a phase that
+  requires **both** dimensions, so the check never invents a requirement.
+
+`UncertaintyEvaluation.is_contradiction` exposes the distinction. A contradiction
+is *not* a doubt: it reports `requires_review == False`, because it is a known
+inconsistency rather than a question for a human.
+
+### 19.8 Negative is not uncertain
+
+`NEGATIVE` (a known failure such as `STILL_OPEN`, `TESTS_FAILED` or a `REFUSE`
+from T26) is deliberately separate from the doubt states (`MISSING`, `UNKNOWN`,
+`UNVERIFIED`, `AMBIGUOUS`). Both refuse, and both are *diagnosable*: the status
+keeps "proven bad" apart from "not proven either way" (`NEGATIVE_EVIDENCE`
+versus `UNKNOWN_EVIDENCE`), the blocking dimension keeps the *source* apart
+(`tests` versus `issue-verification`), and `requires_review` is True only for
+doubt. A known failure is never downgraded to doubt and a doubt is never upgraded
+to a failure.
+
+### 19.9 Fail-closed behaviour
+
+| Input | Result |
+|-------|--------|
+| `phase=None` or any non-`MutationPhase` (a `str`, an int, `True`, another enum) | `INVALID_POLICY` |
+| `evidence` is not a `tuple` (`None`, a list, a set, a mapping, `str`, `bytes`, an object) | `INVALID_INPUT` |
+| an entry is not an `EvidenceItem` | `INVALID_INPUT` |
+| an unknown `dimension` or `state` | `INVALID_INPUT` |
+| a duplicate dimension (two states for one dimension) | `INVALID_INPUT` |
+| an ill-formed diagnostic code (not a bounded token) | `INVALID_INPUT` |
+| a required dimension omitted / supplied as `MISSING` | `MISSING_EVIDENCE` |
+| a required dimension explicitly `CONTRADICTORY` | `CONTRADICTORY_EVIDENCE` |
+| a confirmed claim whose required proof is present but not confirmed | `CONTRADICTORY_EVIDENCE` |
+| a required dimension `NEGATIVE` | `NEGATIVE_EVIDENCE` |
+| a required dimension `UNKNOWN` | `UNKNOWN_EVIDENCE` |
+| a required dimension `UNVERIFIED` | `UNVERIFIED_EVIDENCE` |
+| a required dimension `AMBIGUOUS` | `AMBIGUOUS_EVIDENCE` |
+| an `INVALID` state anywhere in the record | `INVALID_INPUT` |
+| every required dimension `CONFIRMED` | `ALLOWED` |
+
+Nothing is repaired: no value is trimmed, coerced, defaulted or re-ordered, and
+no missing dimension is filled in. `None` never means "confirmed", a falsy value
+is never treated as absent-but-fine, and a truthy object is never believed — a
+state is only ever read by identity, so a value with a clever `__bool__` is
+simply an unusable entry.
+
+### 19.10 Trust boundary
+
+The input is **caller-asserted**. T27 authenticates nothing: it does not read
+Git, run the tests, query SonarQube or verify that the states it is handed are
+true. It is a policy boundary, not an evidence-authentication boundary — a
+caller that misstates a state, or that simply does not call T27 at all, is not
+detected here. T27 exists so that a future orchestration layer can no longer
+*accidentally* commit or push on partial, absent or contradictory evidence, and
+so that the "is this safe?" decision is stated once instead of being re-derived
+(and possibly relaxed) at each call site.
+
+### 19.11 Purity, determinism and diagnostics
+
+* **Pure**: `evaluate_uncertainty` reads only its argument. No clock, environment
+  value, random source, counter or mutable module state is read; no filesystem,
+  network, subprocess or Git operation is performed; no shell command or argv is
+  ever constructed. Every table is a `tuple` or a read-only mapping, and a test
+  snapshots them before and after evaluating and pins that nothing changed.
+* **Deterministic**: the same input always yields an equal record and a
+  byte-for-byte identical `as_dict()`; the caller's tuple order does not matter
+  (evidence is republished in the policy order), and the blocking dimension is
+  the earliest required dimension rather than the first one supplied.
+* **Caller-safe**: the immutable records are never mutated, and a mutable
+  container is refused rather than iterated (a test passes a list, evaluates, and
+  pins that the list is untouched).
+* **Diagnosable**: the exact reason is a pure function of
+  `(status, dimension, state)` — `Refused (missing-evidence): tests is missing -
+  …` — and `reason` plus the status's fixed fail-closed consequence form
+  `reasons`. No caller-authored text and not even a type name can reach a
+  reason, so a reason cannot leak a secret or fabricate a value.
+
+### 19.12 The contract, the result DTO and secret safety
+
+```python
+EvidenceItem(dimension, state, code="")             # one evidence dimension
+UncertaintyInput(phase=None, evidence=())          # caller-asserted facts
+evaluate_uncertainty(*, uncertainty_input) -> UncertaintyEvaluation
+```
+
+`evaluate_uncertainty` takes exactly one keyword-only parameter. A non-
+`UncertaintyInput` raises `TypeError` (a caller error, not an evidence problem);
+every evidence problem is a refusal in the returned record. `UncertaintyInput`
+and `EvidenceItem` are frozen, and `evidence` must be a `tuple`.
+
+`UncertaintyEvaluation` (frozen) carries `policy_version`, `phase`, `status`,
+`decision`, `blocking_dimension`, `blocking_state`, `required_dimensions`,
+`evidence`, `reason` and `reasons`, plus the derived `is_allowed`,
+`is_contradiction` and `requires_review` properties. `as_dict()` is JSON-native
+and deterministic: enum values are published as their strings, tuples as lists,
+the required-dimension table and the evidence in policy order, and
+`required_dimensions` names the exact contract the verdict was measured
+against. Only *validated* values are published — an unusable phase, dimension or
+state is reported as `None`, an unusable evidence record as `[]` plus
+`evidence_is_usable: false`, and a bad code as `None` — so the value that made a
+record ill-formed is never echoed. The one caller-authored value that *is*
+published is a valid, bounded `code`, and only for diagnostics.
+
+### 19.13 Compatibility with T19–T26 (and why T27 imports nothing)
+
+* T27 is **standalone and self-contained**: it imports the standard library only
+  (`__future__`, `dataclasses`, `enum`, `types`, `typing`) and imports **no**
+  repository module — not `issue_status`, not `commit_policy`/`push_policy`, not
+  `branch_protection`, not `overall_report`/`per_issue_report`. A test asserts
+  the imported set exactly, and asserts that no other module in the repository
+  imports `uncertainty_policy` (§19.15).
+* T27 **restates the T19–T26 vocabulary in its own terms** rather than importing
+  it, exactly as T26 keeps its own copy of `PROTECTED_BRANCH_NAMES`. The
+  correspondence is documented in §19.3 and adds no runtime coupling: a change to
+  a T19–T26 status name cannot change a T27 verdict, and a change to T27 cannot
+  change T19–T26.
+* T27 **never contradicts** T19–T26: it consumes their outcomes as evidence and
+  refuses whenever they are absent, doubtful or contradictory. It cannot widen an
+  allow: T20/T21 keep their own gates, T24/T25 keep their bounds and T26 keeps its
+  branch rule — T27 only adds the requirement that the *evidence* be confirmed.
+* The phases mirror the existing lifecycle: `PRE_COMMIT` guards §11 (T20),
+  `POST_COMMIT`/`PRE_PUSH` guard §12 (T21), and `POST_PUSH` closes the run after
+  §12's verification. The `branch-protection` dimension is exactly T26's verdict
+  (§18.8): `ALLOWED` → `CONFIRMED`, `REFUSE` → `NEGATIVE`, and an unevaluated T26
+  → `UNKNOWN` (never `CONFIRMED`).
+
+### 19.14 Tests
+
+`tests/test_uncertainty_policy.py` pins the enums and every table, the one rule,
+the mandated matrix, the full status/every-dimension matrix, one conflict per
+adjacent `PRECEDENCE` pair, both documented hard cases, contradiction detection
+(explicit, paired, and the "both dimensions required" restriction), the
+negative-versus-doubt distinction, every fail-closed input, the code rules, the
+secret-safety decoys, determinism, caller-value safety, canonical ordering,
+frozen records, the exact serializations, and the module surface (imports,
+declared definitions, `__all__`, read-only tables, `__test__ = False`, no
+dangerous call, and "no repository module imports T27").
+
+`uncertainty_policy.py` is at **100% statement and 100% branch coverage** from
+the focused run (`pytest tests/test_uncertainty_policy.py
+--cov=uncertainty_policy --cov-branch`): 214 statements, 64 branches, 0 missing,
+0 partial. The file contains 237 tests.
+
+### 19.15 Integration status — and `main.py` remains unwired
+
+* **T27 is a library with no caller.** `main.py` and T01–T26 are untouched; no
+  production path imports `uncertainty_policy`, and no existing module gained a
+  dependency on it. A test pins the absence of such an import.
+* T27 executes nothing: no Git, no subprocess, no network, no file and no
+  orchestration. It is a decision function and nothing else.
+* A future integration would: map the T19–T26 outcomes onto `EvidenceItem`
+  records (§19.3), call `evaluate_uncertainty` for the phase it is about to
+  enter, and refuse to stage, commit or push on any refusal — reporting
+  `requires_review` distinctly so a doubt can be escalated to a human while a
+  known failure is reported as a failure. That wiring is deliberately **not**
+  part of T27: the policy must be independently testable first, and no
+  orchestration is created prematurely.
+
+### 19.16 Acceptance criteria
+
+1. **Given** every dimension a phase requires is `CONFIRMED`, **then** the
+   verdict is `ALLOWED` with `decision == ALLOW`, `is_allowed == True` and no
+   blocking dimension; **given** any other state for any required dimension,
+   **then** the verdict is a refusal with `is_allowed == False`.
+2. **Given** an omitted required dimension, **then** the verdict is
+   `MISSING_EVIDENCE` and absence is never read as a confirmation.
+3. **Given** a known failure (`NEGATIVE`) on a required dimension, **then** the
+   verdict is `NEGATIVE_EVIDENCE` and `requires_review` is `False`; **given** a
+   doubt (`UNKNOWN`/`UNVERIFIED`/`AMBIGUOUS`), **then** the verdict is the
+   matching doubt status and `requires_review` is `True`. Both refuse.
+4. **Given** a contradiction — an explicit `CONTRADICTORY` dimension, or a
+   confirmed claim whose required proof is present but not confirmed — **then**
+   the verdict is `CONTRADICTORY_EVIDENCE` and `is_contradiction` is `True`.
+5. **Given** a phase that is not a `MutationPhase`, **then** the verdict is
+   `INVALID_POLICY`; **given** an evidence field that is not a tuple of
+   `EvidenceItem` records (wrong type, unknown dimension or state, duplicate
+   dimension, ill-formed code), **then** the verdict is `INVALID_INPUT` and
+   nothing is repaired, trimmed or inferred.
+6. **Given** any of the mandated cases (an unknown issue outcome, a failed
+   Codex run, an invalid scope, failed tests, an incomplete analysis, an
+   unverified issue verification, a missing correlation, a refused or unknown
+   branch protection, a missing worktree/scope record, an unverified or
+   mismatched commit, contradictory commit evidence, an unknown push result and
+   an unverified remote tip), **then** the mutation is refused.
+7. **Given** identical inputs, **then** the verdict is equal, `as_dict()` is
+   byte-for-byte identical, the evidence is published in policy order whatever
+   the caller's tuple order was, and no caller value changed.
+8. **Given** any inputs, **then** no I/O, no Git operation, no command and no
+   mutation occurs, no caller-authored text (other than a valid diagnostic code)
+   is published, and the required-evidence table cannot be weakened.
 
