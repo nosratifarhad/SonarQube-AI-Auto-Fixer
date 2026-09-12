@@ -56,12 +56,29 @@ How T20 is expected to use it
    ``attribution.agent_files`` - never ``after.changed_files`` - after its other
    gates (FIXED status, no unresolved review condition, Codex uncertainty gate,
    secret scan) have passed.
+
+T20 additions (still read-only)
+-------------------------------
+5. ``capture(repo, include_ignored=True)`` additionally records
+   ``ignored_files``. An AI agent can create an ignored file that never shows up
+   in an ordinary untracked-file listing, so T20 compares the baseline ignored
+   set against the post-run ignored set and refuses on an unexpected addition.
+6. ``content_id_of(path)`` / ``index_equivalent_blobs`` expose the **Git**
+   content identity of a worktree path:
+   ``git hash-object --path=<relative-path> -- <relative-path>``. That command
+   applies the same ``.gitattributes`` / clean filters / CRLF normalisation that
+   ``git add`` applies, so the value equals the blob id the index will hold once
+   the path is staged (``git ls-files -s -- <relative-path>``). Hashing raw
+   worktree bytes is *not* Git identity and is never used for it.
+7. All of the above stays read-only: ``rev-parse``, ``status``, ``diff``,
+   ``hash-object`` (never with ``-w``), always argument arrays, never a shell.
 """
 
 from __future__ import annotations
 
 import hashlib
 import os
+import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -77,6 +94,10 @@ _STAGED_CODES = frozenset({"M", "A", "D", "R", "C", "T"})
 _UNSTAGED_CODES = frozenset({"M", "D", "T"})
 #: Porcelain v1 status for an untracked entry.
 _UNTRACKED = "??"
+#: Porcelain v1 status for an ignored entry (only reported with ``--ignored``).
+_IGNORED = "!!"
+#: Windows drive prefix: a path like ``C:/x`` can never be repository-relative.
+_WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:")
 
 
 class WorktreeBaselineError(Exception):
@@ -100,6 +121,17 @@ class WorktreeSnapshot:
         fingerprints: per-path content fingerprint (``"worktree:<sha256>"`` for
             tracked changes, ``"blob:<object id>"`` for untracked files). A path
             without a fingerprint is still reported through the status lists.
+        index_equivalent_blobs: per-path Git **content identity** - the blob id
+            ``git hash-object --path=<path> -- <path>`` reports, i.e. exactly the
+            object staging those worktree bytes would store. Paths that do not
+            exist in the working tree (deletions) cannot be hashed and are
+            therefore absent. This is Git identity, never a raw byte hash.
+        ignored_files: repository-relative paths Git reports as ignored. Only
+            populated for ``capture(..., include_ignored=True)``; an ignored file
+            is reported here and never placed in ``changed_files``.
+        ignored_scan: ``True`` only when ``include_ignored=True`` was requested,
+            so an *empty* ignored set can never be confused with "the ignored
+            set was never read". T20 fails closed when this is ``False``.
     """
 
     __test__ = False
@@ -114,6 +146,9 @@ class WorktreeSnapshot:
     deleted_files: Tuple[str, ...]
     renamed_files: Tuple[Tuple[str, str], ...]
     fingerprints: Mapping[str, str] = field(default_factory=dict)
+    index_equivalent_blobs: Mapping[str, str] = field(default_factory=dict)
+    ignored_files: Tuple[str, ...] = ()
+    ignored_scan: bool = False
 
     @property
     def changed_set(self) -> frozenset:
@@ -123,6 +158,16 @@ class WorktreeSnapshot:
     def fingerprint_of(self, path: str) -> Optional[str]:
         """The recorded fingerprint for ``path``, or ``None`` when unknown."""
         return self.fingerprints.get(path)
+
+    def content_id_of(self, path: str) -> Optional[str]:
+        """Git content identity of ``path``, or ``None`` when it was not captured.
+
+        The value is the blob id ``git hash-object --path=<path> -- <path>``
+        returns, so it equals the index blob id once the path is staged and is
+        directly comparable with ``git ls-files -s -- <path>``. ``None`` means
+        "unknown", which callers must treat as a refusal, never as a match.
+        """
+        return self.index_equivalent_blobs.get(path)
 
     def as_dict(self) -> dict:
         """Secret-free summary suitable for logging/reporting."""
@@ -136,6 +181,9 @@ class WorktreeSnapshot:
             "untracked_files": list(self.untracked_files),
             "deleted_files": list(self.deleted_files),
             "renamed_files": [list(pair) for pair in self.renamed_files],
+            "index_equivalent_blobs": dict(self.index_equivalent_blobs),
+            "ignored_files": list(self.ignored_files),
+            "ignored_scan": self.ignored_scan,
         }
 
 
@@ -273,8 +321,24 @@ class WorktreeBaselineInspector:
     # Public API
     # ------------------------------------------------------------------
 
-    def capture(self, repository_path: PathLike) -> WorktreeSnapshot:
+    def capture(
+        self,
+        repository_path: PathLike,
+        *,
+        include_ignored: bool = False,
+    ) -> WorktreeSnapshot:
         """Snapshot the working tree of ``repository_path``.
+
+        Args:
+            repository_path: existing Git working copy to inspect.
+            include_ignored: additionally record the ignored-file set
+                (``ignored_files``) and the Git content identity of every
+                changed path that exists (``index_equivalent_blobs``). Ignored
+                paths are *reported only* - they never enter ``changed_files``
+                and nothing is ever staged. T20 requires this so an
+                agent-created ignored file cannot slip past the baseline
+                comparison. ``False`` (the default) keeps the previous
+                behaviour for every T01-T19 caller.
 
         Returns:
             A :class:`WorktreeSnapshot`. Nothing is staged, committed, reset,
@@ -283,6 +347,8 @@ class WorktreeBaselineInspector:
         Raises:
             WorktreeBaselineError: the path is missing / is not a Git working
                 copy, or a Git command fails, times out, or cannot be launched.
+                A failed ignored-file or content-identity read fails closed
+                (never a silently empty result).
         """
         repository = Path(repository_path).expanduser()
         if not repository.is_dir():
@@ -295,6 +361,9 @@ class WorktreeBaselineInspector:
         porcelain = self._run(repository, "status", "--porcelain=v1", "-z",
                               "--untracked-files=all")
         text = str(porcelain.stdout or "")
+        ignored_files = (
+            self._ignored_files(repository) if include_ignored else ()
+        )
         if text.strip("\0") == "":
             return WorktreeSnapshot(
                 repository_path=repository,
@@ -307,6 +376,9 @@ class WorktreeBaselineInspector:
                 deleted_files=(),
                 renamed_files=(),
                 fingerprints={},
+                index_equivalent_blobs={},
+                ignored_files=ignored_files,
+                ignored_scan=include_ignored,
             )
 
         staged: set = set()
@@ -335,6 +407,7 @@ class WorktreeBaselineInspector:
 
         changed_files = tuple(sorted(changed))
         fingerprints = self._fingerprints(repository, changed_files, untracked)
+        content_ids = self._content_ids(repository, changed_files)
 
         return WorktreeSnapshot(
             repository_path=repository,
@@ -347,11 +420,93 @@ class WorktreeBaselineInspector:
             deleted_files=tuple(sorted(deleted)),
             renamed_files=tuple(sorted(renamed)),
             fingerprints=fingerprints,
+            index_equivalent_blobs=content_ids,
+            ignored_files=ignored_files,
+            ignored_scan=include_ignored,
         )
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _ignored_files(self, repository: Path) -> Tuple[str, ...]:
+        """Return the sorted repository-relative paths Git reports as ignored.
+
+        ``--ignored=matching`` lists individual ignored *files* (not just the
+        containing directory), so an agent-created ignored file cannot hide
+        behind a directory summary. The result is reported only - T20 never
+        stages an ignored path, it refuses when one is approved.
+
+        Raises:
+            WorktreeBaselineError: Git could not produce the list (fail closed:
+                "could not read" must never look like "nothing is ignored").
+        """
+        completed = self._run_raw(
+            repository,
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignored=matching",
+        )
+        if completed is None:
+            raise WorktreeBaselineError(
+                f"Failed to run Git executable '{self._git_command}'."
+            )
+        if int(completed.returncode) != 0:
+            detail = redact_credentials(str(completed.stderr or "").strip())
+            raise WorktreeBaselineError(
+                "Failed to read the ignored-file set from Git"
+                f"{': ' + detail if detail else '.'}"
+            )
+        ignored = set()
+        for xy, path, _origin in _parse_porcelain_z(str(completed.stdout or "")):
+            if xy == _IGNORED and path:
+                ignored.add(path)
+        return tuple(sorted(ignored))
+
+    def _content_ids(
+        self, repository: Path, changed_files: Sequence[str]
+    ) -> Dict[str, str]:
+        """Git content identity (blob id) for every changed path that exists.
+
+        ``git hash-object --path=<path> -- <path>`` is used - never a raw byte
+        hash - because ``--path`` makes Git apply exactly the ``.gitattributes``
+        clean filters, CRLF normalisation and external filters it applies when
+        the path is staged. The value therefore equals the blob id the index
+        will hold after ``git add -- <path>``.
+
+        Paths that do not exist in the working tree (deletions) are skipped:
+        Git cannot hash a missing file and T20 refuses a deletion outright.
+
+        Raises:
+            WorktreeBaselineError: Git could not be launched, or could not hash
+                an existing path (fail closed - an unreadable file must never
+                silently lose its content identity).
+        """
+        content_ids: Dict[str, str] = {}
+        for path in changed_files:
+            if not _is_safe_relative_path(path):
+                continue
+            if not (repository / path).is_file():
+                continue
+            completed = self._run_raw(
+                repository, "hash-object", f"--path={path}", "--", path
+            )
+            if completed is None:  # pragma: no cover - defensive
+                raise WorktreeBaselineError(
+                    f"Failed to run Git executable '{self._git_command}'."
+                )
+            if int(completed.returncode) != 0:
+                detail = redact_credentials(str(completed.stderr or "").strip())
+                raise WorktreeBaselineError(
+                    f"Failed to compute the Git content identity of {path!r}"
+                    f"{': ' + detail if detail else '.'}"
+                )
+            value = str(completed.stdout or "").strip()
+            if value:
+                content_ids[path] = value
+        return content_ids
 
     def _head_commit(self, repository: Path) -> Optional[str]:
         """Return the current ``HEAD`` commit id, or ``None`` when unreadable."""
@@ -434,6 +589,27 @@ class WorktreeBaselineInspector:
             raise WorktreeBaselineError(
                 redact_credentials(f"Failed to run git: {exc}")
             ) from exc
+
+
+def _is_safe_relative_path(path: object) -> bool:
+    """True when ``path`` is a plain repository-relative path.
+
+    Git reports repository-relative paths, but they are still checked before
+    they are used to touch the filesystem: absolute paths (POSIX, Windows drive
+    or UNC), ``..`` components, empty components, ``.`` and NUL can never be a
+    safe repository-relative path.
+    """
+    value = "" if path is None else str(path)
+    if not value or "\0" in value:
+        return False
+    if value.startswith(("/", "\\")) or _WINDOWS_DRIVE.match(value):
+        return False
+    parts = [part for part in value.replace("\\", "/").split("/") if part != ""]
+    if not parts:
+        return False
+    return all(part != ".." for part in parts) and not any(
+        part == "." for part in parts
+    )
 
 
 def _repository_key(repository_path: object) -> str:

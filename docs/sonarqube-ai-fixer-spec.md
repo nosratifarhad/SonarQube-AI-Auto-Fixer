@@ -1,9 +1,13 @@
-# SonarQube AI Auto-Fixer — Domain & Behaviour Specification (T04–T19)
+# SonarQube AI Auto-Fixer — Domain & Behaviour Specification (T04–T21)
 
-Status: **POC implementation complete (T01–T19), pre-T20 safety hardening
-applied** · T20+ deliberately not implemented · No real SonarQube credentials or
-pushes are ever made by this tool · Tests never invoke a real Codex CLI, never
-need a real project toolchain, and never need a live SonarQube server.
+Status: **POC implementation complete (T01–T21)** · T20 (safe, fail-closed,
+exactly-one-commit Git commit) and T21 (safe, fail-closed, exactly-one-push Git
+push of a T20 `COMMITTED` result) are implemented; T22+ deliberately not
+implemented · No real SonarQube credentials and no real push are ever made by
+this tool (every T21 push targets a bare repository under `tmp_path`) · Tests
+never invoke a real Codex CLI, never need a real project toolchain, never need a
+live SonarQube server, and never touch the real repository (every T20/T21 test
+uses a real repository under `tmp_path`).
 
 ## 1. Purpose
 
@@ -64,7 +68,9 @@ or closed, and no source code is modified by these stages.
 | T19 | Final issue status decision (pure precedence over T11/T13/T15/T16/T17/T18) | `issue_status.py` | ✔ |
 | — | Pre-T20 safety primitive: clean-baseline capture + change attribution | `worktree_baseline.py` | ✔ (primitive only, no commit) |
 | — | Pre-T20 safety primitive: secret scan of a future commit's content | `secret_scan.py` | ✔ (primitive only, no commit) |
-| T20+ | Commits, pushes, PRs, reporting, limits, retry loops, protection, CI | — | ✖ not implemented |
+| T20 | Safe, fail-closed, exactly-one-commit Git commit of a verified fix | `commit_message.py`, `commit_policy.py`, `git_commit.py` | ✔ |
+| T21 | Safe, fail-closed, exactly-one-push Git push of a T20 `COMMITTED` result | `push_policy.py`, `git_push.py` | ✔ |
+| T22+ | PRs, reporting, limits, retry loops, protection, CI | — | ✖ not implemented |
 
 ## 3. Actors and system context
 
@@ -261,6 +267,14 @@ that the analysis was successfully requested — never that it finished, and nev
 that the issue is gone. Credentials travel through the environment
 (`build_sonar_environment`), never as command-line arguments.
 
+`SonarAnalysisTriggerResult.evidence()` projects a trigger result onto the
+frozen `AnalysisTriggerEvidence`: the trigger outcome plus the compute-engine
+task id, and nothing else. That compact record — never the captured output, the
+argv or the exit code — is what T19 carries forward in
+`IssueStatusResult.trigger_evidence` (§4.11) so T20 can cross-check it (§11.2,
+G11). The projection exists precisely so the T16 evidence cannot be dropped,
+duplicated wholesale or leaked on the way.
+
 ### 4.9 `SonarAnalysisCompletion` (T17)
 
 `SonarAnalysisCompletion` (frozen, from `sonar_analysis_waiter.py`) records
@@ -303,15 +317,22 @@ makes the correlation `UNKNOWN`, which fails closed.
 
 `IssueStatusResult` (frozen, from `issue_status.py`) is the final decision for
 one attempt: `status` (`IssueFinalStatus`), `decisive_stage`, `reason`,
-`reasons`, plus the five inputs it used (`codex`, `scope`, `tests`, `analysis`,
-`verification`). Flags: `is_fixed`, `needs_review`, `blocking_reason`
-(`None` only for `FIXED`), `reason_text`; `as_dict()` nests the (already
-sanitized) sub-summaries.
+`reasons`, plus the inputs it used (`codex`, `scope`, `tests`, `analysis`,
+`verification`, `trigger_evidence`). Flags: `is_fixed`, `needs_review`,
+`blocking_reason` (`None` only for `FIXED`), `reason_text`; `as_dict()` nests the
+(already sanitized) sub-summaries.
 
-`determine_issue_status(codex=…, scope=…, tests=…, analysis=…, verification=…)`
-is a pure, deterministic function of those five typed results — no HTTP, no
-subprocess, no files, no retry, no Codex re-invocation, no commit, no push, and
-no branch change.
+`trigger_evidence` is the compact T16 record (§4.8) — or `None` when no T16
+result was supplied — and it is carried on **every** verdict, not only `FIXED`.
+It is what makes the T16 → T19 → T20 chain provable: T20 reads it and refuses
+(G11) when the evidence is absent, unusable or contradicts the T17 completion.
+
+`determine_issue_status(codex=…, scope=…, tests=…, analysis=…, verification=…,
+trigger=None)` is a pure, deterministic function of those typed results — no
+HTTP, no subprocess, no files, no retry, no Codex re-invocation, no commit, no
+push, and no branch change. `trigger` stays optional for *classification*: the
+T17-only rows of §4.14 continue to work, and requiring the T16 evidence is T20's
+decision at the irreversible step.
 
 ### 4.12 Issue identity strategy (T18) and its limitations
 
@@ -445,9 +466,17 @@ fix.
 
 `FIXED` acceptance criteria (all mandatory): Codex executed successfully, scope
 validation passed, project tests passed, the SonarQube analysis completed
-successfully (with a matching T16 task id when that evidence is supplied), the
-issue's own file changed, the snapshot is **correlated** (`CORRELATED`), and the
-original issue is reliably absent from the new SonarQube result.
+successfully (with a matching T16 task id), the issue's own file changed, the
+snapshot is **correlated** (`CORRELATED`), and the original issue is reliably
+absent from the new SonarQube result.
+
+A `FIXED` verdict is a *claim*, not permission to commit. It also carries the
+T16 evidence in `trigger_evidence`, and T20 (§11) re-checks that evidence and
+fails closed when it is absent, unusable or contradictory. When no T16 result
+was supplied, T19 can still reach `FIXED` from T17 evidence alone (the last
+three rows of the table above), but `trigger_evidence` is then `None` and T20
+refuses: that path is a *classification* path, never a *commit* path.
+
 `REVIEW_REQUIRED` is used whenever any required piece of evidence is missing or
 ambiguous. T19 never retries, never re-invokes Codex, never starts another
 attempt, and never changes the prompt or branch (iteration limits are T25).
@@ -692,9 +721,10 @@ a different repository, or an unsafe context `file_path`, raises
    7. `FIXED`
 4. Grant `FIXED` only when **all** of the following hold: Codex executed
    successfully, scope validation passed, the project tests passed, the
-   SonarQube analysis completed successfully (with a matching T16 task id when
-   supplied), the analysis is `CORRELATED`, the issue's own file changed, and
-   the original issue is reliably absent from the new SonarQube result.
+   SonarQube analysis completed successfully (with a matching T16 task id), the
+   analysis is `CORRELATED`, the issue's own file changed, and the original
+   issue is reliably absent from the new SonarQube result. The T16 evidence is
+   carried out of this stage as `trigger_evidence` (or `None`, which T20 refuses).
 5. **Stop.** T19 only classifies the current attempt: no retry, no second
    attempt, no prompt change, no new branch, no commit, no push.
 
@@ -704,6 +734,29 @@ a different repository, or an unsafe context `file_path`, raises
 > **The issue is `FIXED` only when the original issue is reliably verified as
 > absent from a *correlated* analysis and all required preconditions have
 > passed.**
+
+### B17 — Commit the verified fix (T20)
+
+1. Input: the T19 `IssueStatusResult` (which must be `FIXED`), the pre-run and
+   post-run `WorktreeSnapshot`s taken with `include_ignored=True`, the
+   `BaselineAttribution` of this run, and the configured secret values.
+2. Evaluate `G1`; derive the commit message deterministically from the validated
+   rule key, the approved path and the issue key (`commit_message`).
+3. Inspect the environment (S2, before any Git process), resolve the repository
+   identity (S1), and check the branch, the explicit identity and the repository
+   state (S3-S5). Enforce `G29-G37` **here**, before anything is resolved or
+   staged.
+4. Verify the baseline and the whole-tree attribution (S6, `G2-G18`), resolve the
+   approved file set exactly once (S7, `G19-G24`), and scan the approved content
+   and the worktree diff (S8, `G25-G27`).
+5. Stage exactly the approved paths (`git add -- <paths>`, S9), verify the index
+   (`G38-G40`), scan the staged diff (`G28`), and re-verify the staged and
+   worktree content immediately before committing (`G41-G42`, S12).
+6. Attempt exactly one `git commit -m <message>` (S13) and prove the result
+   (S14, `G43-G45`): one new commit, the expected parent, message, identity,
+   paths, blob ids, branch and worktree root, and a clean approved path set.
+7. **Stop.** One commit, or a refusal/failure result - never a push, never a
+   fetch, never a reset, never a retry, never a second commit.
 
 ## 6. Failure scenarios
 
@@ -1131,6 +1184,39 @@ Pre-T20 safety primitives
     (`ok is False`) rather than as clean.
 23. Neither new primitive is wired into a commit, a push, or any production
     workflow: they are safety foundations for T20 only.
+24. T20 is the **only** component allowed to write to Git, and it performs exactly
+    two writes: one exact-path `git add -- <paths>` and one `git commit -m <text>`.
+    Any other subcommand raises `GitCommitError` before a process is launched
+    (allow-list), and the destructive/network subcommands are additionally named
+    in an explicit deny-list.
+25. T20 never resets, restores, unstages, stashes, checks out, retries or amends:
+    a failed commit leaves the staged state exactly as it is for a human to
+    inspect, and a commit that cannot be proven becomes `COMMIT_UNVERIFIED`
+    (loud), never a silent pass.
+26. T20 refuses to commit on a protected/reserved branch (`main`, `master`,
+    `develop`, `trunk`, the configured default branch) or on any branch outside
+    the agent namespace (`ai/sonar-fix/`): T07 owns branch creation and T20 never
+    creates, switches or deletes a branch.
+27. T20 requires an explicit `user.name`/`user.email` that is exactly what
+    `git var` reports; a fabricated OS/domain identity is never accepted, and the
+    commit is executed with `-c user.name=… -c user.email=… -c
+    user.useConfigOnly=true` so Git cannot guess one.
+28. The validated command line may not contain any repository redirect
+    (`-C`, `--git-dir`, `--work-tree`, `--namespace`, `--exec-path`) and `git
+    config` is read-only: T20 can never operate on another repository and can
+    never write configuration.
+29. Content identity is Git identity, never a raw byte hash: the approved ids come
+    from `git hash-object --path=<path> -- <path>`, so CRLF normalisation,
+    `.gitattributes` and clean filters are applied exactly as staging applies
+    them, and the ids are compared against `git ls-files -s`, the committed tree
+    and a final pre-commit re-check.
+30. Commit messages are derived, bounded and injection-proof: no free-form text
+    ever reaches Git, control/terminal-escape characters and NUL are removed or
+    rejected, the subject is a single line, and the message is passed as one
+    `-m` argv item (never interpolated into a shell).
+31. The secret scan covers the approved file content, the worktree diff and the
+    staged diff; a secret in any of the three (or a scan that could not run) is a
+    refusal, and the matched value never appears in a reason, a result or a log.
 
 ## 9. Automated test mapping
 
@@ -1152,17 +1238,32 @@ Pre-T20 safety primitives
 | `tests/test_sonar_analysis_waiter.py` | T17 immediate/late success, failed, canceled, timeout, not found, API errors, malformed payloads, identity/resolver, bounded polls |
 | `tests/test_sonar_issue_verification.py` | T18 identity ladder, ambiguity, message/rule non-matches, fail-closed page completeness, malformed payloads, retrieval failure, correlation verdicts, opt-in filtering |
 | `tests/test_analysis_correlation.py` | T17→T18 correlation verdicts (exact/missing/wrong-component/undeclared), metadata redaction, determinism, end-to-end refusal of `FIXED` |
-| `tests/test_issue_status.py` | T19 every stage and combination, precedence, T16→T17→T19 matrix, correlation gate, `FIXED` acceptance, `REVIEW_REQUIRED` cases, determinism |
+| `tests/test_issue_status.py` | T19 every stage and combination, precedence, T16→T17→T19 matrix, correlation gate, `FIXED` acceptance, `REVIEW_REQUIRED` cases, determinism, carried `trigger_evidence` |
 | `tests/test_worktree_baseline.py` | pre-T20 baseline capture (staged/unstaged/untracked/deleted/renamed/ignored), read-only guarantees, attribution of pre-existing vs agent changes, failure modes |
 | `tests/test_secret_scan.py` | pre-T20 secret scan: configured secrets (added/removed/context), URL userinfo, false-positive-safe URLs, fail-closed input handling, no secret leakage |
+| `tests/test_commit_message.py` | T20 message: deterministic format, bounds, shortening ladder, argv safety, control/escape/NUL/newline injection, unusable rule/path/issue keys, validator and sanitizer contracts |
+| `tests/test_commit_policy.py` | T20 gates: gate catalogue/phase map integrity, all 45 gates pass on the happy-path record, fail-closed on missing facts, every gate's refusal condition (G1–G45), phase `NOT_REACHED` prefixes, config policy, approved-set resolution, path normalisation |
+| `tests/test_git_commit.py` | T20 executor against real `tmp_path` repositories: the happy path (exactly one commit, expected parent/message/identity/blobs), pre-Git refusals (T19 status, Codex, tests, analysis, verification, dirty baseline, out-of-scope/deleted/renamed/unchanged target), environment/branch/identity/index-lock/merge/detached refusals, injected `add`/`commit` failures, staged-content change before the commit, `COMMIT_UNVERIFIED`, ignored/binary/secret changes, CRLF/`.gitattributes`/clean-filter content identity, allow-list and hostile-argv refusals |
+| `tests/test_push_policy.py` | T21 gates: gate catalogue/phase-map integrity, all 48 gates pass on the happy-path record, fail-closed on unknown facts, one adversarial break per gate (G1–G48), phase `NOT_REACHED` prefixes, cascade reporting, refspec/remote-name/remote-URL/commit-id/path primitives, `PushRequest` completeness, policy configuration |
+| `tests/test_git_push.py` | T21 executor against real `tmp_path` repositories with a bare remote: the happy path (exactly one push, exact argv, read-back proof, unchanged local state, new remote branch, module helper), pre-push refusals (non-`COMMITTED` T20 result, out-of-band commit, missing/protected/non-agent destination, protected source, missing/credential-bearing/unreadable remote, alternate push URL, default push refspec, dirty/staged/detached/merge states, already-pushed commit, remote moved out of band, bare or non-repository path, unsafe environment, caller errors), faults (rejected, timed-out, "successful" but unmoved, unreadable read-back, missing Git), the command audit (allow-list, argv, environment hardening, read-only `config`), the pre-push checkpoint race, the real-repository safety check, and the module API |
+| `tests/test_trigger_evidence.py` | T21.1.a provenance: T16 `evidence()` is the minimal frozen projection (no stdout/argv/exit-code leakage), T19 carries it on **every** verdict and exposes it in `as_dict()`, and the real T20 executor commits using the evidence the T19 result carried while refusing (G11 `FAIL`, no commit created) when it is missing, unusable or mismatched |
+| `tests/test_t20_t21_integration.py` | T21.1.c real T20→T21 handoff: a genuine `GitCommitExecutor` commit in a `tmp_path` clone feeds a genuine `GitPushExecutor.push_safely` both as the `CommitResult` object and as its `as_dict()` view (exactly one push, local bare remote read back at `T20.new_head`, local state unchanged), plus the pinned `CommitResult.as_dict()` → `_project_t20` → `PushFacts` key contract |
+| `tests/test_overall_report.py` | T22 (§13): pure aggregation of T19/T20/T21 evidence, every source status and count, the end-to-end/partial/failed/review classifications, every fail-closed gate (G1-G20), determinism, ordering, secret safety, immutability, the S0-S11 state machine, canonical serialization, and a genuine `GitCommitExecutor`/`GitPushExecutor` handoff in a `tmp_path` clone whose repository is provably untouched by the report |
+| `tests/test_overall_report_policy.py` | T22 (§13): gate catalogue/`GATE_PHASE` integrity, policy defaults and derived evidence requirements, the collection/identity/value/payload helpers, the fail-closed failure-report contract, and the module's freedom from any execution dependency |
 
 Run: `.venv\Scripts\python -m pytest -q --cov=. --cov-report=term-missing`
 
-## 10. Non-goals (unchanged for T20+)
+## 10. Non-goals (unchanged for T22+)
 
-* No commit/push/PR creation (T20–T21), no reporting (T22–T23), no
+* No PR creation (T22+), no reporting beyond the T22 structured overall report
+  (§13) and no T23 per-issue reporting,
   retry/iteration loops or limits (T24–T25), no branch/rule protection
   (T26–T28), no production logging, container, or GitLab CI wiring (T29–T32).
+* T20 performs exactly two Git writes and T21 exactly one (see §11, §12), and
+  nothing else: they never push more than once, fetch, pull, clone, reset,
+  restore, clean, stash, check out, switch, amend, retry, or write
+  configuration, and they never create or delete a branch (T07 owns branch
+  creation).
 * T13–T19 perform no Git mutations and no orchestration: T13 is pure policy,
   T14 runs only the configured project-test command, T15 is pure
   classification, T16 only *triggers* the analysis, T17 only *waits*, T18 only
@@ -1184,40 +1285,696 @@ Run: `.venv\Scripts\python -m pytest -q --cov=. --cov-report=term-missing`
 * T14 does not install dependencies, build the project, or run anything other
   than the single configured test command, and T15 never acts on an outcome
   (no retry, no Codex re-invocation, no branching logic).
-* `main.py` deliberately remains unwired: T05–T19 are validated as units with
+* `main.py` deliberately remains unwired: T05–T22 are validated as units with
   injectable boundaries, and full pipeline orchestration (including how the
-  scanner command, test command, and branch names are configured for a real
-  project) is not part of this scope.
+  scanner command, test command, branch names and push remote are configured for
+  a real project) is not part of this scope. T21 in particular is **not** called
+  by any production path yet: nothing pushes automatically, and T22 is a library
+  with no caller either (it consumes results, it never produces them).
 
-## 11. Pre-T20 safety prerequisites (documented, not implemented)
+## 11. T20 — safe, fail-closed, exactly-one-commit Git commit (implemented)
 
-T20 (Git commit) is **not implemented**. The primitives below exist only so that
-T20 can be written safely later; they never commit, push, stage, reset, clean or
-delete anything.
+T20 turns a T19 `FIXED` attempt into **at most one** commit that contains
+exactly the change this run made. It is three modules, with the mutation
+boundary enforced in code rather than by convention:
 
-A future T20 must refuse to commit unless **all** of the following hold:
+| Module | Role | Writes to Git |
+|--------|------|---------------|
+| `commit_message.py` | deterministic, bounded, injection-proof commit message (pure) | never |
+| `commit_policy.py` | the 45 gates, approved-set resolution and path normalisation (pure, no I/O) | never |
+| `git_commit.py` | the executor: collects evidence, evaluates gates, performs the two writes | exactly two commands |
 
-1. `IssueFinalStatus == FIXED` (`IssueStatusResult.is_fixed is True`).
-2. No unresolved review condition: `needs_review is False` and
-   `blocking_reason is None`; in particular the analysis must be
-   `CORRELATED` and the absence `reliable_absence`-grade.
-3. The Codex uncertainty gate is satisfied: `CodexResultAnalysis
-   .output_suggests_uncertainty is False` (the marker scan is advisory for T19
-   but must be a hard gate for a commit; the final gate itself is T27).
-4. Clean baseline attribution: `worktree_baseline.BaselineAttribution
-   .attributable is True` (the pre-Codex working tree was clean and no
-   pre-existing change was touched).
-5. The staged set is exactly the allowed changed-file set - built from
-   `attribution.agent_files` (never from a whole-tree `changed_files` list) and
-   intersected with the T13 allowed scope, which must equal the issue's target
-   file.
-6. Secret scan passed: `secret_scan.SecretScanner(secrets).scan_diff(...)`
-   returns `ok is True` for the exact content being committed, including the
-   SonarQube token(s) from `AnalysisConfig.secrets` and URL-userinfo shapes.
-7. No change outside the intended scope: `ChangeScopeResult.is_valid is True`
-   with `unexpected_files == ()`.
+### 11.1 The two and only two Git writes
 
-Any condition that cannot be evaluated must fail closed (no commit), and no
-commit may be produced by a component other than T20.
+1. **exact-path staging** - `git add -- <exact approved paths>`
+2. **exactly one commit** - `git commit -m <validated message>`
 
+Everything else T20 runs is read-only (`rev-parse`, `rev-list`, `status`,
+`diff`, `diff-tree`, `ls-files`, `ls-tree`, `hash-object` without `-w`, `log`,
+`config --get…`, `var`, `symbolic-ref`, `show-ref`, `cat-file`,
+`check-ignore`).
+
+* `ALLOWED_GIT_SUBCOMMANDS` is an allow-list: any other subcommand raises
+  `GitCommitError` **before** a process is launched.
+* `FORBIDDEN_GIT_SUBCOMMANDS` names the destructive and network operations
+  explicitly (`reset`, `restore`, `clean`, `stash`, `checkout`, `switch`,
+  `update-ref`, `reflog`, `rm`, `mv`, `merge`, `rebase`, `cherry-pick`,
+  `revert`, `am`, `apply`, `push`, `fetch`, `pull`, `remote`, `clone`,
+  `branch`, `tag`, `gc`, `prune`, `repack`, `filter-branch`, `filter-repo`,
+  `replace`, `notes`, `worktree`, `submodule`, `commit-tree`,
+  `update-server-info`, `daemon`, `archive`, `bundle`, `fsck`), so the refusal
+  is intentional and testable.
+* `add` must carry `--` followed by exact paths: `.`, `-A`, `--all`, `-u`,
+  `--update`, `-f`, `--force`, `-N`, `-p`, `-i`, `-e`, a token starting with
+  `-`, and a `:`-prefixed pathspec are all refused.
+* `commit` must carry exactly one `-m` and no pathspec; `--amend`,
+  `--no-verify`, `--allow-empty`, `--allow-empty-message`, `-a`, `-o`, `-i`,
+  `-p`, `-F`, `-C`, `-c`, `-e`, `--fixup`, `--squash`, `--edit`,
+  `--reuse-message`, `--pathspec-from-file` and `--pathspec-file-nul` are
+  refused.
+* `-c` overrides are limited to `user.name=`, `user.email=` and
+  `user.useConfigOnly=`; anything else (a hook path, a filter, a template, an
+  fsmonitor program) is refused.
+* Repository/work-tree/program redirects - `-C`, `--git-dir`, `--work-tree`,
+  `--namespace`, `--exec-path`, in both the separate and the `=` form - are
+  refused inside the validated arguments: T20 fixes the repository with its own
+  single `-C <root>`.
+* `git config` is read-only (`--get`, `--get-all`, `--get-regexp`, `--list`,
+  `-l` only), so T20 can never write configuration.
+* Git runs with a sanitized environment: the unsafe `GIT_*` variables
+  (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`,
+  `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_COMMON_DIR`, `GIT_NAMESPACE`,
+  `GIT_CEILING_DIRECTORIES`, `GIT_DISCOVERY_ACROSS_FILESYSTEM`,
+  `GIT_CONFIG`/`GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`/`GIT_CONFIG_COUNT`,
+  `GIT_SSH_COMMAND`/`GIT_SSH`, `GIT_EXTERNAL_DIFF`, `GIT_AUTHOR_*`,
+  `GIT_COMMITTER_*`) are a refusal **and** are removed from every child;
+  `GIT_TERMINAL_PROMPT=0`, `GIT_OPTIONAL_LOCKS=0` and `GIT_PAGER=cat` are always
+  forced. Shell/IDE helpers that cannot redirect this commit (`GIT_ASKPASS`,
+  `GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, `GIT_PAGER`) are deliberately *not*
+  refusals - T20 always passes `-m`, never prompts and never fetches - so a
+  normal developer machine cannot produce a false refusal. The caller's
+  environment mapping is never mutated.
+* `shell=False` everywhere (argument arrays only), and Git stderr is
+  credential-redacted before it reaches a reason or an exception.
+
+
+
+
+### 11.2 The 45 gates (G1-G45)
+
+`commit_policy.GATES` is the authoritative list; every gate has exactly one
+evaluator (`_GATE_EVALUATORS`, asserted against `GATES` on import) and exactly
+one phase (`_GATE_PHASE`). A gate is `NOT_REACHED` until its phase has run,
+`PASS` when its fact proves the condition, and `FAIL` (fail closed) otherwise;
+the decision is `REFUSE` as soon as any evaluated gate fails, so the report
+identifies **every** refusal instead of only the first one.
+
+| Gates | Phase (state-machine stage) | Condition |
+|-------|-----------------------------|-----------|
+| G1 | `INPUTS` (S0) | every required input is present and usable |
+| G2-G3 | `FIX_EVIDENCE` (S0/S6) | T19 status is `FIXED`; no review condition or blocking reason |
+| G4-G6 | `FIX_EVIDENCE` | Codex succeeded; no uncertainty marker; no review request |
+| G7-G9 | `FIX_EVIDENCE` | T13 scope valid; the issue's own file changed; tests passed |
+| G10-G14 | `FIX_EVIDENCE` | analysis succeeded; task id present **and** matching the required T16 evidence (a missing, unusable or contradictory T16 record fails closed, so the cross-check can never be skipped silently); snapshot correlated; reliable absence; no positive finding |
+| G15-G18 | `FIX_EVIDENCE` | attribution valid; baseline clean and fully captured; no pre-existing target modification; whole tree accounted for (no unexplained change, no ignored file created) |
+| G19-G24 | `APPROVAL` (S7/S8) | approved set non-empty and exactly resolved; no deletion; no rename; literal safe paths; no ignored approved path |
+| G25-G28 | `APPROVAL`/`STAGING` | no binary approved file; content, worktree-diff and staged-diff secret scans passed |
+| G29-G37 | `REPOSITORY` (S1-S5) | repository identity valid; environment safe; HEAD not detached; branch not protected/reserved and inside the agent namespace; explicit identity; no operation in progress and no index lock; no unmerged entries; no active hook T20 cannot account for; HEAD unchanged since the baseline |
+| G38-G41 | `STAGING`/`COMMIT` (S10-S12) | worktree still matches the approved content; staged set exactly the approved set; staged content equals the approved content; staged/worktree content unchanged immediately before the commit |
+| G42 | `COMMIT` (S12) | the commit message is valid and names exactly the approved file/rule/issue |
+| G43-G45 | `VERIFY` (S13/S14) | the single commit attempt succeeded; the post-commit state proves exactly one commit with the expected parent/message/identity/paths/blobs/branch/root; no unexpected Git error |
+
+### 11.3 The state machine (each stage runs only when every earlier gate passed)
+
+```
+S0  VALIDATE_INPUTS        G1                       (build/validate the message, too)
+S1  IDENTIFY_REPOSITORY    G29                      (read-only)
+S2  CHECK_ENVIRONMENT      G30                      (before any Git process)
+S3  CHECK_BRANCH           G31, G32
+S4  CHECK_IDENTITY         G33
+S5  CHECK_REPO_STATE       G34-G37                  -> repository checkpoint
+S6  VERIFY_BASELINE        G2-G18
+S7  RESOLVE_APPROVED_SET   G19-G24                  (once; then immutable)
+S8  SCAN_APPROVED_CONTENT  G25-G27                  -> approval checkpoint
+S9  STAGE_EXACT_FILES      -                        (first Git write)
+S10 VERIFY_INDEX           G38-G40
+S11 SCAN_STAGED_CONTENT    G28
+S12 FINAL_PRE_COMMIT_CHECK G41, G42                  -> commit checkpoint
+S13 COMMIT                 -                        (second and last Git write, one attempt)
+S14 VERIFY_COMMIT          G43-G45                  -> final checkpoint
+```
+
+The repository checkpoint (S5) runs **before** the approved set is resolved and
+long before the first Git write, so a protected branch, a redirected
+environment, a missing identity, a held index lock or an in-progress operation
+can never even reach `git add`.
+
+
+### 11.4 The commit message (T20.4)
+
+`commit_message.build_commit_message(rule=…, file_path=…, issue_key=…)` is pure
+and deterministic - no clock, no random value, no environment lookup - and
+produces a conventional commit that preserves the SonarQube identity:
+
+```
+fix(sonar): resolve python:S1481 in src/app.py
+
+Sonar-Issue: AX1abcDefG
+Sonar-Rule: python:S1481
+```
+
+* Only three validated values may enter the text: the Sonar rule key, the
+  repository-relative target path and the issue key. Nothing else - least of all
+  free-form Codex or SonarQube message text - is ever interpolated.
+* The subject is a single line, never starts with `-`, and is shortened
+  deterministically (full path -> basename -> rule only -> hard truncation) when
+  the configured caps require it; the whole message honours
+  `CommitPolicyConfig.max_message_length` and the subject
+  `DEFAULT_MAX_SUBJECT_LENGTH`.
+* NUL, C0/C1 controls, `\r`, terminal escape sequences and newline injection are
+  removed (sanitizer) or rejected (validator/builder); an unusable rule key, an
+  unsafe path, an over-long value or a non-text value raises
+  `CommitMessageError` instead of being repaired.
+* The text is handed to Git as one argv item (`("commit", "-m", text)`); the
+  subject can never be split into options.
+* `validate_commit_message` is the G42 verdict and returns `None` for anything
+  unsafe; the builder re-validates its own output before returning.
+
+### 11.5 Outcomes and failure semantics
+
+| `CommitStatus` | Meaning | Git state |
+|----------------|---------|-----------|
+| `COMMITTED` | exactly one verified commit was created | HEAD advanced by exactly one commit from the recorded baseline |
+| `REFUSED` | a gate refused; no commit was attempted | nothing was staged **unless** the refusal came from the pre-commit re-check (S12), in which case the approved paths are staged and left exactly as they are |
+| `COMMIT_FAILED` | the single `git commit` attempt failed | the staged state is left untouched; no reset/restore/unstage/stash/retry |
+| `COMMIT_UNVERIFIED` | a commit exists but its correctness could not be proven | the commit is left in place and reported loudly for a human |
+
+Failure handling is deliberately **passive**: T20 never resets, restores,
+unstages, stashes, checks out, cleans, amends or retries. Only genuine
+caller/environment errors (a missing `IssueStatusResult`, a repository path that
+does not exist, a forbidden command shape, a Git launch failure) raise
+`GitCommitError`; an unusable *Git working copy* is a `REFUSED` result with the
+G29 verdict.
+
+`CommitResult` is typed, immutable and secret-free (`as_dict()` carries the
+status, reason, the full state-machine trail, the approved paths, the content
+ids, the message, the head boundary and all 45 gate verdicts), so T21+ can
+report it without leaking anything.
+
+### 11.6 Policy configuration (defaults are the conservative choice)
+
+| `CommitPolicyConfig` | Default | Effect |
+|----------------------|---------|--------|
+| `protected_branches` | `main`, `master`, `develop`, `trunk` | never receive a T20 commit |
+| `default_branch` | `None` | additionally refused (so a renamed default branch is still refused) |
+| `required_branch_prefix` | `ai/sonar-fix` | a branch outside this namespace is refused (T07 owns branch creation) |
+| `require_explicit_identity` | `True` | refuse unless `user.name`/`user.email` are explicitly configured |
+| `require_clean_baseline` | `True` | refuse unless the pre-run tree was clean (an empty index is always required) |
+| `allow_ignored_approved_paths` | `False` | test-only override; production never approves an ignored path |
+| `max_approved_files` | `50` | a bigger set means the scope was not resolved |
+| `max_message_length` | `200` | handed to the message validator |
+| `extra_allowed_files` | `()` | files T13 explicitly proved in addition to the issue's own file |
+
+### 11.7 Acceptance criteria
+
+1. **Given** a T19 `FIXED` result **when** T20 runs on an agent branch with an
+   explicit identity, a clean baseline and one exactly-attributed in-scope file,
+   **then** exactly one commit is created, its parent is the recorded baseline
+   HEAD, it contains only the approved path(s), its author and committer are the
+   verified identity, its message is the derived message, and no other branch,
+   commit or configuration value changed.
+2. **Given** any refusal condition (a non-`FIXED` T19 status, uncertainty or a
+   review request, failed tests, an unverified/uncorrelated analysis, a dirty or
+   incomplete baseline, a pre-existing target change, an out-of-scope, deleted,
+   renamed, ignored, binary or secret-bearing change, a protected or non-agent
+   branch, a detached HEAD, a missing identity, an unsafe environment, a held
+   index lock, an in-progress operation, an unmerged index, an active hook, a
+   moved HEAD, or an unprovable message) **then** the result is `REFUSED`, no
+   commit reaches history, and - for everything before S9 - not even `git add`
+   is launched.
+3. **Given** a commit that fails **then** the status is `COMMIT_FAILED`, the
+   staged state is untouched, exactly one attempt was made, and no recovery
+   command ran.
+4. **Given** a commit that cannot be proven correct afterwards **then** the
+   status is `COMMIT_UNVERIFIED` and the commit is left in place for a human.
+5. **Given** an argv T20 is not allowed to run (a forbidden subcommand, a broad
+   staging form, `--amend`, `--no-verify`, an unapproved `-c` override, a
+   repository redirect) **then** `GitCommitError` is raised **before** any
+   process is launched.
+6. **Given** CRLF content, a `.gitattributes` override or a clean filter
+   **then** the approved, staged and committed content identity agree exactly
+   (Git identity, never a raw byte hash) and the commit succeeds.
+
+## 12. T21 — safe, fail-closed, exactly-one-push Git push (implemented)
+
+T21 turns a T20 `COMMITTED` result into **at most one** push that moves exactly
+the one recorded commit to exactly one destination branch. It is two modules,
+with the mutation boundary enforced in code rather than by convention:
+
+| Module | Role | Writes to Git | Contacts the remote |
+|--------|------|---------------|---------------------|
+| `push_policy.py` | the 48 gates, the phase map, the observation/fact records and the refspec/remote validators (pure, no I/O) | never | never |
+| `git_push.py` | the executor: collects evidence, evaluates gates, performs the one push, reads the result back | exactly one command | read-only until S11 (`ls-remote`), read-only again after it |
+
+### 12.1 The one and only Git write
+
+1. **exactly one push** - `git push <validated remote> refs/heads/<branch>:refs/heads/<remote_branch>`
+
+Everything else T21 runs is read-only (`rev-parse`, `rev-list`, `status`,
+`diff`, `symbolic-ref`, `show-ref`, `config --get-*`, `var`, `merge-base`,
+`ls-remote`, `log`, `ls-files`, `ls-tree`, `cat-file`). The boundary is enforced
+in code:
+
+* `ALLOWED_GIT_SUBCOMMANDS` is an allow-list; any other subcommand raises
+  `GitPushError` **before** a process is launched.
+* `FORBIDDEN_GIT_SUBCOMMANDS` names the destructive/network operations
+  explicitly - including `add`/`commit` (T20 owns them) and `fetch`/`pull`/
+  `clone` - so T21 can never perform T20's write or fetch objects.
+* A `git push` must carry exactly `<remote> <refspec>`: no option, no `--`, no
+  force token, no wildcard, no deletion, and both refspec sides fully qualified,
+  so neither `push.default` nor a `remote.<name>.push` rule can redirect it.
+* `-c` overrides are never passed (`_ALLOWED_CONFIG_OVERRIDES` is empty), and
+  `git config` is accepted only with a **read verb** (`--get`, `--get-all`,
+  `--get-regexp`, `--list`), so a scope option alone (`--local`) can never be a
+  disguised configuration write.
+* Repository-redirecting options (`-C`, `--git-dir`, `--work-tree`,
+  `--namespace`, `--exec-path`) are refused in every spelling, including the
+  `--option=value` and attached (`-C/path`) forms.
+* The argv is validated **again** immediately before the launch, so the command
+  that runs is provably the command the gates approved.
+* Git children run with a sanitized environment: every unsafe `GIT_*` variable
+  is refused *and* removed, and `GIT_TERMINAL_PROMPT=0`, `GIT_OPTIONAL_LOCKS=0`
+  and `GIT_PAGER=cat` are forced. The caller's environment mapping is never
+  mutated, `shell=False` is used everywhere, and Git output is
+  credential-redacted before it reaches a reason, an observation or an exception.
+
+### 12.2 The 48 gates (G1-G48)
+
+`push_policy.GATES` is the authoritative list; every gate has exactly one
+evaluator (`_GATE_EVALUATORS`, asserted against `GATES` on import) and exactly
+one phase (`_GATE_PHASE`). A gate is `NOT_REACHED` until its phase has run,
+`PASS` when its fact proves the condition, and `FAIL` (fail closed) otherwise;
+the decision is `REFUSE` as soon as any evaluated gate fails, so the report
+identifies **every** refusal instead of only the first one.
+
+| Gates | Phase (state-machine stage) | Condition |
+|-------|-----------------------------|-----------|
+| G1 | `INPUTS` (S0) | the request names a repository, an expected commit, a source branch, a remote and a destination branch |
+| G2-G5 | `CONTRACT` (S1) | the supplied T20 result reports `COMMITTED` with a full commit id, the request expects exactly that commit, and the T20 result is internally consistent (status, flags, heads, repository root and branch) |
+| G6-G9 | `REPOSITORY` (S3) | a usable, non-bare working copy whose resolved root is the expected repository, whose index lives inside its own Git directory, and whose HEAD is not detached |
+| G10 | `ENVIRONMENT` (S2) | no unsafe Git environment variable is set (checked before any Git process) |
+| G11-G15 | `BRANCH` (S4) | a valid branch is checked out, it is the expected source branch, it is inside the agent namespace, and it is neither protected nor the default branch |
+| G16-G18 | `COMMIT` (S5) | HEAD is exactly the recorded commit, that commit exists locally, and it is the tip of the source branch (so a later commit cannot ride along) |
+| G19-G21 | `WORKTREE` (S6) | the working tree is clean, nothing is staged, and no other Git operation is in progress (no index lock) |
+| G22-G26 | `REMOTE` (S7) | the destination remote name is well formed, the remote exists, its push configuration is unambiguous (one URL, no alternate push URL, no rewrite rule, no default push refspec), its URL is readable/well formed, and it embeds no credentials |
+| G27-G36 | `TARGET` (S8) | the destination branch is valid, not protected, not the default and inside the agent namespace; the refspec is exactly the one T21 builds, fully qualified, wildcard-free, deletion-free, force-free, option-free and maps the source branch to the destination branch |
+| G37-G38 | `ANCESTRY` (S9) | the push adds exactly the one recorded commit (or creates the destination branch), and the remote's current value is a proven ancestor, so the push cannot rewrite remote history |
+| G39-G42 | `CHECKPOINT` (S10) | HEAD, the branch and the worktree/index are unchanged across two consecutive pre-push readings, and every pre-push gate (G1-G41) passed in the final checkpoint |
+| G43 | `VERIFY` (S11) | the single push command reported success |
+| G44-G46 | `VERIFY` (S12) | the remote was read back with a read-only command, the destination branch points at the recorded commit, and the update is exactly the expected fast-forward |
+| G47-G48 | `VERIFY` (S13) | the local repository is unchanged after the push, and the push result is internally consistent (one `push` token, no broadening option, the remote and the refspec present, and verification in step with the push outcome) |
+
+### 12.3 The state machine (each stage runs only when every earlier gate passed)
+
+| Stage | Name | Gates | What it does |
+|-------|------|-------|--------------|
+| S0 | `VALIDATE_INPUTS` | G1 | requires an existing repository directory (otherwise `GitPushError`) and builds the immutable `PushRequest`; a destination branch is **never** defaulted |
+| S1 | `CHECK_T20_CONTRACT` | G2-G5 | projects the T20 result read-only (it is never mutated) |
+| S2 | `CHECK_ENVIRONMENT` | G10 | inspects the process environment *before* any Git process |
+| S3 | `IDENTIFY_REPOSITORY` | G6-G9 | resolves the root, Git dir, index and HEAD with read-only Git |
+| S4 | `CHECK_BRANCH` | G11-G15 | reads the checked-out branch and resolves the default branch from `refs/remotes/<remote>/HEAD` (never from the network) |
+| S5 | `CHECK_COMMIT` | G16-G18 | proves HEAD is the recorded commit and is the branch tip |
+| S6 | `CHECK_WORKTREE` | G19-G21 | reads `status --porcelain -z`, the staged set and the operation markers |
+| S7 | `INSPECT_REMOTE` | G22-G26 | reads the remote configuration and the destination ref with `ls-remote` (no fetch, no object transfer) |
+| S8 | `RESOLVE_TARGET` | G27-G36 | fixes the exact branch and refspec; the option list is empty by construction |
+| S9 | `PROVE_ANCESTRY` | G37-G38 | counts the commits the push would add and proves a fast-forward with `merge-base --is-ancestor` |
+| S10 | `FINAL_PRE_PUSH_CHECK` | G39-G42 | takes two consecutive checkpoints; if anything moved, the push is not launched |
+| S11 | `PUSH` | G43 | the single and only mutating command |
+| S12 | `VERIFY_REMOTE` | G44-G46 | reads the destination ref back with `ls-remote` |
+| S13 | `VERIFY_LOCAL` | G47-G48 | re-reads the local state and checks the result is internally consistent |
+
+### 12.4 The push argv and the refspec
+
+* The command is always `[git, "-C", <resolved root>, "push", <remote>, <refspec>]`
+  - `shell=False`, argv-only, and the `-C <root>` prefix is built *outside* the
+  validated argument list.
+* The refspec is built, never accepted:
+  `refs/heads/<branch>:refs/heads/<remote_branch>`. `build_refspec` refuses an
+  invalid branch name, and `parse_refspec` *reports* (rather than hides) a `+`
+  force prefix or a `*` wildcard so the gates can refuse them by name.
+* `HEAD`, a short branch name, a single ref, a deletion (`src:`/`:dst`), a tag, a
+  remote name, a wildcard, a forcing refspec and more than one mapping are all
+  refused.
+* The destination remote is contacted read-only until S11 and read-only again
+  after it: `ls-remote --heads <remote> <ref>` transfers no objects and writes
+  nothing, so T21 never fetches.
+
+### 12.5 Outcomes and failure semantics
+
+| `PushStatus` | Meaning | Remote state |
+|--------------|---------|--------------|
+| `PUSHED` | exactly one push ran and the destination branch was read back at the recorded commit | the destination branch moved from its recorded value to the recorded commit |
+| `REFUSED` | a gate refused before the push; not a single `git push` was attempted | untouched |
+| `PUSH_FAILED` | the single `git push` attempt ran (or could not be launched) and failed | untouched by T21; T21 never forces, retries or fetches afterwards |
+| `PUSH_UNVERIFIED` | a push ran but its effect on the remote could not be proven locally | possibly updated; a human must inspect it |
+
+Failure handling is deliberately **passive**: on a push failure T21 does not
+force, retry, fetch, pull, reset, clean or unstage. The remote and the working
+copy are left exactly as they are and the result says so. Only genuine
+caller/environment errors (a missing repository path, a path that is not a
+directory, a forbidden command shape, a Git launch failure) raise
+`GitPushError`; an unusable repository, remote or commit is a `REFUSED` result.
+
+`PushResult` is typed, immutable and secret-free (`as_dict()` carries the status,
+reason, the full state-machine trail, the request, the repository, the remote,
+the recorded push attempt, the pre/post checkpoints, the commit boundary, the
+refspec and all 48 gate verdicts), so T22+ can report it without leaking
+anything.
+
+### 12.6 Policy configuration (defaults are the conservative choice)
+
+| `PushPolicyConfig` | Default | Effect |
+|--------------------|---------|--------|
+| `protected_branches` | `main`, `master`, `develop`, `trunk` | never pushed to **or** from |
+| `default_branch` | `None` | additionally refused as a destination; when `None` the executor resolves it from `refs/remotes/<remote>/HEAD` and still refuses a mismatch (an unresolvable default branch refuses rather than guesses) |
+| `required_branch_prefix` | `ai/sonar-fix` | both the source and the destination branch must live in this namespace (T07 owns branch creation) |
+| `require_clean_worktree` | `True` | refuse unless the worktree and index are clean after the T20 commit |
+| `allow_new_remote_branch` | `True` | the destination branch may be created at the recorded commit; an existing destination must fast-forward by exactly the one recorded commit |
+
+### 12.7 Integration contract with T20 (and why T21 does not call it)
+
+* T21 is handed three things: the repository path T20 worked in, the T20
+  `CommitResult` object (or its `as_dict()` view) and the destination remote
+  branch. Everything else is derived from the T20 result, so the push cannot
+  target anything else.
+* T21 **does not call T20** and does not re-derive the fix: it *reads* the
+  result. A bare commit id is never accepted as proof - G2, G3 and G4 read the
+  T20 status, the T20 commit id and the T20 repository/branch and refuse
+  otherwise, so an out-of-band commit cannot ride along.
+* T20 stores the *resolved* worktree root; T21 resolves the same path before
+  comparing it, and G7 refuses when the resolved root is not the expected
+  repository.
+* The boundary is one-way: `git_push`/`push_policy` never import `git_commit`,
+  and neither is wired into `main.py`. Nothing pushes automatically.
+* **Both shapes are contractual and are exercised against real code**
+  (`tests/test_t20_t21_integration.py`): a genuine `GitCommitExecutor` run in a
+  temporary repository produces a genuine `CommitResult`, which is then handed to
+  `GitPushExecutor.push_safely` **twice** — once as the `CommitResult` object and
+  once as `CommitResult.as_dict()` — and both times exactly one push runs and the
+  local bare remote's destination branch is read back at the T20 commit.
+* The same file **pins the projection**: the exact key paths
+  `git_push._project_t20` reads out of `CommitResult.as_dict()` (`status`,
+  `is_committed`, `new_head`, `commit_sha`, `previous_head`, `needs_attention`,
+  `repository.is_valid`, `repository.worktree_root` / `repository.expected_root`,
+  `repository.branch`) are asserted to exist and to project onto the documented
+  `PushFacts` fields, so renaming or dropping one without updating T21 fails
+  loudly instead of silently turning every push into a refusal.
+* **Still the orchestrator's responsibility (open):** nothing in T20 or T21
+  *derives* the repository path, the source branch, the destination branch, the
+  remote name or the destination branch name from T07/T19. They are supplied
+  out-of-band, and the future orchestrator (T22+) must supply them consistently.
+  T21 only bounds them (an agent-namespace source **and** destination branch that
+  is neither protected nor the default branch) — no shared run context exists,
+  and none is claimed here.
+
+### 12.8 Acceptance criteria
+
+1. **Given** a T20 `COMMITTED` result on an agent branch, a clean worktree, a
+   resolvable remote and one commit ahead of the destination branch, **when**
+   T21 runs, **then** exactly one `git push` is launched, the destination branch
+   moves from the recorded value to the recorded commit, the remote is read back
+   and confirmed, and the local repository (HEAD, branch, index, worktree, local
+   configuration, other remote-tracking refs) is unchanged.
+2. **Given** a destination branch that does not exist yet **when** T21 runs
+   **then** exactly one push creates it at the recorded commit.
+3. **Given** any refusal condition (a non-`COMMITTED` T20 result, an expected
+   commit that is not the T20 commit, a bare or non-repository path, a detached
+   HEAD, a protected, non-agent or default source/destination branch, a dirty or
+   staged worktree, an in-progress operation, a missing, ambiguous,
+   credential-bearing or unreadable remote, a hostile refspec, an already-pushed
+   commit, a remote that moved out of band, an unsafe environment, or a move
+   detected between the two pre-push checkpoints) **then** the result is
+   `REFUSED`, the remote is untouched, and **not a single** `git push` (nor any
+   other mutating command) is launched.
+4. **Given** a push that fails or times out **then** the status is
+   `PUSH_FAILED`, exactly one attempt was made, and no force, retry, fetch, pull,
+   reset or clean command ran.
+5. **Given** a push that reports success but cannot be confirmed **then** the
+   status is `PUSH_UNVERIFIED` and the remote is reported loudly for a human.
+6. **Given** an argv T21 is not allowed to run (a forbidden subcommand, a
+   redirecting global option, an unapproved `-c` override, a configuration write,
+   a push option, a force token, a wildcard, a deletion or a
+   non-fully-qualified refspec) **then** `GitPushError` is raised **before** any
+   process is launched.
+7. **Given** a hostile process environment (`GIT_DIR`, `GIT_WORK_TREE`, ...)
+   **then** the run refuses with `REFUSED` before launching any Git process, and
+   the caller's environment mapping is not mutated.
+
+
+## 13. T22 — overall report (implemented, not wired)
+
+T22 answers one question: *what happened overall after processing one or more
+SonarQube issues?* It is a **pure aggregation/reporting layer** over the evidence
+T19, T20 and T21 already produced:
+
+```
+T19 IssueStatusResult  ->  T20 CommitResult  ->  T21 PushResult  ->  T22 OverallReport
+```
+
+| Module | Role | Side effects |
+|--------|------|--------------|
+| `overall_report.py` | immutable input/result DTOs, the state machine, the 20 gates, the aggregation, `as_dict()`/`serialize_report` | **none** |
+
+### 13.1 Purpose, scope and non-goals
+
+* T22 consumes the results of T19/T20/T21; it never produces evidence itself.
+* It does **not** decide whether an issue *should* have been fixed, and it never
+  infers success from missing evidence.
+* It runs **no** Git command, no SonarQube call, no Codex run, no project test,
+  no subprocess, no network request, and it never touches the filesystem or a
+  repository. `overall_report` imports `json` and `re` only, and projects the
+  results through the same `as_dict()` views T21 uses (never `asdict()`, never a
+  private attribute).
+* **It is not wired into `main.py`**: `main.py` is byte-for-byte unchanged.
+* It does **not** implement T23 (per-issue reporting), T24–T25 (limits), T26–T28
+  (protections), T29–T32 (logging/containers/CI) and it introduces no
+  `RunContext`.
+
+### 13.2 Inputs
+
+```python
+IssueLifecycleInput(issue_key, issue_status, commit_result=None, push_result=None)
+```
+
+Neither the T19 result nor the T20/T21 results carry the issue key, so the caller
+pairs them explicitly; T22 never derives a key from a commit message, a branch or
+a path. `build_overall_report(entries=..., policy=..., forbidden_secrets=...)`
+accepts any iterable of `IssueLifecycleInput` **or** of mappings that carry
+exactly `issue_key`, `issue_status`, `commit_result`, `push_result` (an unknown
+field is refused), so the serialized `as_dict()` views can be fed back in.
+
+Each result may be the production DTO **or** its `as_dict()` view; a value that
+projects to neither is a gate failure, never a guess.
+
+### 13.3 The state machine (S0-S11; a failure stops the run)
+
+| Phase | Gates | Invariant established |
+|-------|-------|-----------------------|
+| S0 `INPUT` | — | the input container was received |
+| S1 `INPUT_VALIDATED` | G1-G3 | every entry has a safe, unique issue key |
+| S2 `ISSUE_RESULTS_VALIDATED` | G4, G5 | every T19 result is usable |
+| S3 `LIFECYCLE_RESULTS_VALIDATED` | G6-G9 | every T20/T21 result is usable |
+| S4 `ISSUE_OUTCOMES_AGGREGATED` | G15 | the T19 counts sum to the total |
+| S5 `COMMIT_OUTCOMES_AGGREGATED` | G16 | the T20 counts sum to the T20 results |
+| S6 `PUSH_OUTCOMES_AGGREGATED` | G17 | the T21 counts sum to the T21 results |
+| S7 `CROSS_STAGE_CONSISTENCY_CHECKED` | G10-G14 | the T20/T21 evidence is not contradictory |
+| S8 `OVERALL_STATUS_RESOLVED` | — | the overall status is derived from the counts |
+| S9 `REPORT_BUILT` | G18 | the built report satisfies its own invariants |
+| S10 `REPORT_VERIFIED` | G19, G20 | the report is JSON-safe and secret-free |
+| S11 `COMPLETE` | — | the report is returned |
+
+The trail is part of the report (`OverallReportState.stage_records`,
+`reached_phases`, `phase`, `failed_phase`, `gates`, `status_of`, `first_failure`).
+Every gate is **always** present: a gate whose phase did not run is
+`NOT_REACHED`, and a phase failure never lets a later phase run. The authored gate
+numbers are not the execution order — the cross-stage gates kept the numbers
+G10-G14 but run in S7, after the aggregation phases that own G15-G17 (exactly as
+T20's G28/STAGING runs before G29-G37/REPOSITORY); `GATE_PHASE` is the executable
+record of the execution order.
+
+
+### 13.4 The 20 gates (G1-G20)
+
+| Gate | Checks |
+|------|--------|
+| G1 | the input is an iterable collection of entries (not `None`, a bare string/bytes, a mapping or a number) |
+| G2 | every entry is an `IssueLifecycleInput`/entry mapping and carries a safe, non-empty, ≤100-character SonarQube-shaped issue key |
+| G3 | no two entries declare the same issue key |
+| G4 | every T19 result projects to a mapping with a well-formed `status`, and its `is_fixed`/`needs_review` flags (when present) agree with it |
+| G5 | every T19 `status` is one of the seven production `IssueFinalStatus` values |
+| G6 | every supplied T20 result projects to a mapping with a well-formed `status`, a boolean `is_committed`/`needs_attention`, and full-commit-id `new_head`/`commit_sha`/`previous_head` when present |
+| G7 | every supplied T20 `status` is one of the four production `CommitStatus` values |
+| G8 | every supplied T21 result projects to a mapping with a well-formed `status`, boolean flags, and full-commit-id `expected_commit`/`remote_before_commit`/`remote_after_commit` when present |
+| G9 | every supplied T21 `status` is one of the four production `PushStatus` values |
+| G10 | T20 agrees with itself: `is_committed`/`needs_attention` match the status, a `COMMITTED` result carries `new_head == commit_sha` and `new_head != previous_head` |
+| G11 | T21 agrees with itself: `is_pushed`/`is_refusal`/`needs_attention` match the status, a `PUSHED` result was attempted and moved the remote to exactly `expected_commit`, an unverified push was attempted, a refusal was not, and the refspec matches its source and destination branches |
+| G12 | a push attempt names exactly the commit T20 created |
+| G13 | a push attempt is rooted in a `COMMITTED` T20 result with a usable id and the same branch |
+| G14 | the lifecycle is coherent: no T20 evidence for an issue T19 did not verify as fixed, no T21 evidence without a T20 result, and no commit message that names a different issue key |
+| G15 | the T19 status counts sum to the number of classified issues |
+| G16 | the T20 status counts sum to the number of supplied T20 results |
+| G17 | the T21 status counts sum to the number of supplied T21 results |
+| G18 | `verify_overall_report` confirms every count, ordering and classification invariant of the **built** report |
+| G19 | the payload is plain JSON data and survives a `json.dumps`/`json.loads` round trip |
+| G20 | the serialized report matches none of the caller's configured secrets (and no credential-bearing URL) |
+
+An unrecognised status, a malformed result, a contradiction, a count violation, an
+unserializable payload and a secret are all **refusals**: they are never silently
+counted, never repaired and never mapped onto the nearest status.
+
+### 13.5 Overall status semantics
+
+| `OverallStatus` | Meaning |
+|-----------------|---------|
+| `EMPTY` | no entry was supplied — never `SUCCESS` |
+| `SUCCESS` | every entry reached the policy's required end state |
+| `PARTIAL_SUCCESS` | at least one entry did, and at least one did not |
+| `FAILED` | nothing reached it and nothing needs review |
+| `REVIEW_REQUIRED` | the report is invalid, or nothing succeeded and at least one entry could not be classified safely |
+
+`is_valid` describes the *report*, not the run: it is `True` whenever every gate
+passed and every count invariant held (a single `PUSH_UNVERIFIED` issue is a valid
+report whose status is `REVIEW_REQUIRED`). A gate failure always yields
+`is_valid = False`, `status = REVIEW_REQUIRED` and the failed gates named in
+`validation_errors`. `needs_attention` is `True` for any report that is not a
+clean `SUCCESS`/`EMPTY`, and for any issue that asked for it. `ReportDecision` is
+`PROCEED` only for `SUCCESS`.
+
+
+### 13.6 Issue outcomes and the count invariants
+
+Each classified issue gets one compact `IssueOverallSummary` (deliberately **not**
+the T23 per-issue report): the issue key, the three *source* statuses verbatim,
+T22's outcome, the three derived booleans, `needs_attention`, the commit id, the
+pushed commit and T22's own reason sentence. Summaries are sorted by issue key.
+
+| `IssueOutcome` | Meaning |
+|----------------|---------|
+| `DELIVERED` | the issue reached the policy's required end state |
+| `NOT_DELIVERED` | it is fixed, but a required later stage was refused or failed |
+| `NOT_FIXED` | T19 did not verify the fix (a definite, unambiguous failure) |
+| `REVIEW_REQUIRED` | the evidence is ambiguous, missing or unverified |
+
+The classification ladder is: **uncertainty first** (a `REVIEW_REQUIRED` T19, a
+`COMMIT_UNVERIFIED` T20 or a `PUSH_UNVERIFIED` T21 is never a success and never a
+failure) → a non-`FIXED` T19 is `NOT_FIXED` → otherwise the policy's required end
+state decides, where a required stage that produced **no** result is
+`REVIEW_REQUIRED` (missing evidence is never assumed) while a stage that ran and
+resolved is `NOT_DELIVERED` → only a proven end state is `DELIVERED`.
+
+The report validates itself (`verify_overall_report`, the body of G18) before it
+is returned:
+
+* `total_issues == successful_issues + failed_issues + review_required_issues ==
+  len(issue_outcomes)`, and `total_issues <= input_entries`;
+* `sum(issue_counts) == total_issues`, `sum(commit_counts) == commit_result_count`,
+  `sum(push_counts) == push_result_count`, and each count map always covers the
+  **complete** production status vocabulary;
+* `commit_result_count + commit_not_executed_count == total_issues` (and the same
+  for push) — "not executed" is the *absence* of a T20/T21 result, never a T20/T21
+  status;
+* the summaries are sorted by issue key and unique;
+* the decision, `needs_attention`, the state's decision and the overall status all
+  agree with the counts.
+
+### 13.7 Cross-stage consistency (the lifecycle cases)
+
+"Fixed" is not "committed" and "committed" is not "pushed": an issue can be
+`FIXED` but not `COMMITTED`, or `FIXED` + `COMMITTED` but not `PUSHED`, and those
+are reported as such (`issue_fixed`, `change_committed`, `change_pushed`).
+
+| Case | Evidence | T22 |
+|------|----------|-----|
+| A | `FIXED` + `COMMITTED` + `PUSHED` | `DELIVERED`; with the default policy the run is `SUCCESS` |
+| B | `FIXED` + `COMMITTED` + `PUSH_UNVERIFIED` | `REVIEW_REQUIRED` for that issue (never `SUCCESS`) |
+| C | `FIXED` + T20 `REFUSED` + no T21 | valid lifecycle, `NOT_DELIVERED` |
+| D | a T20 result for a T19 status that is not `FIXED` | contradictory → G14 → the report is refused |
+| E | T20 `COMMITTED` without a usable `new_head`/`commit_sha` | G10 → refused |
+| F | T21 `PUSHED` without `expected_commit` | G11 → refused |
+| G | T21 push evidence although T20 did not verify a commit | G13 → refused |
+| H | `push.expected_commit != t20.new_head` | G12 → refused |
+| I | `remote_after_commit != expected_commit` | G11 → refused |
+| — | T21 evidence without any T20 result | G14 → refused |
+| — | `FIXED` + missing T20 while the policy requires commit evidence | `REVIEW_REQUIRED` (never an assumed commit) |
+| — | `FIXED` + `COMMITTED` + missing T21 while the policy requires push evidence | `REVIEW_REQUIRED` (never an assumed push) |
+
+No contradiction is ever resolved by choosing the more optimistic reading, and no
+result is ever rewritten: the source statuses are preserved verbatim in every
+summary and in `issue_counts`/`commit_counts`/`push_counts`.
+
+### 13.8 Policy configuration (defaults are the conservative choice)
+
+| `OverallReportPolicy` | Default | Effect |
+|-----------------------|---------|--------|
+| `expected_end_state` | `PUSHED` | an issue only reaches `DELIVERED` when `FIXED` + `COMMITTED` + `PUSHED`; `requires_commit_evidence`/`requires_push_evidence` are derived from it (`COMMITTED` needs a T20 result, `ISSUE_FIXED` needs neither) |
+
+The policy is part of the report (`policy.as_dict()`), so a report always explains
+which end state its classification used.
+
+### 13.9 Determinism, serialization and secret safety
+
+* The same input always produces the same report, the same `as_dict()` and the
+  same `serialize_report()` text. Issue summaries are sorted by issue key; gate
+  problems are de-duplicated and sorted per gate; there is no timestamp and no
+  unordered iteration anywhere in the output.
+* `as_dict()` returns only approved report fields as plain JSON data (str/int/
+  bool/None/list/dict), so `json.dumps(report.as_dict())` always works.
+  `serialize_report()` is canonical (`sort_keys=True`, no cosmetic whitespace).
+* **Secret safety is structural**: T22 never copies free-form upstream text (no
+  reasons, no stage trails, no gate verdicts, no remote URLs), only statuses,
+  counts, full commit ids and issue keys that matched the strict key shape. G20
+  then scans the *serialized* report against the caller's configured secrets
+  (`forbidden_secrets`, normally `AnalysisConfig.secrets`) plus URL-userinfo
+  shapes, and a match refuses the report — the returned failure report never
+  echoes the offending value.
+* An unexpected internal error is converted into the same fail-closed refusal
+  (naming only the exception *type*), never into a success and never into a
+  traceback.
+
+
+### 13.10 Output DTO
+
+```python
+OverallReport(
+    status, is_valid, decision, policy,
+    input_entries, total_issues,
+    successful_issues, failed_issues, review_required_issues,
+    issue_counts, commit_counts, push_counts,
+    commit_result_count, commit_not_executed_count,
+    push_result_count, push_not_executed_count,
+    issue_outcomes, reasons, validation_errors, state, report_version,
+)
+```
+
+`status`/`decision`/`needs_attention`/`end_to_end_*_count`/`issue_keys`/
+`generated_from` are derived, so they can never disagree with the counts. Every
+DTO is a frozen dataclass and every sequence is a tuple; `state` carries all 20
+gate verdicts and the phase trail. `report_version` is `t22.1`.
+
+### 13.11 Test mapping
+
+| Test file | Covers |
+|-----------|--------|
+| `tests/test_overall_report.py` | aggregation (none/one/many/mixed), every T19/T20/T21 status and count, the end-to-end success path, partial success, fixed-but-not-committed, committed-but-not-pushed, missing T20/T21 evidence under each policy, every cross-stage contradiction (G10-G14), unknown statuses, duplicate/invalid identities, gap-1 input shapes, the count invariants and their monkeypatched self-check seams (G15/G18/G19/G20), determinism and ordering, secret safety, immutability, the full state machine, canonical serialization, and the **real** `GitCommitExecutor`/`GitPushExecutor` handoff in a `tmp_path` clone (report built from genuine DTOs, repository provably untouched) |
+| `tests/test_overall_report_policy.py` | gate catalogue and `GATE_PHASE` integrity (including that a failure leaves every later phase's gates `NOT_REACHED`), policy defaults/derived requirements, the collection/identity/value/payload helpers, the failure-report contract, and that the module imports no execution dependency |
+| `tests/t22_fixtures.py` | non-collected fixtures: real T19 statuses, real T20/T21 DTOs, their `as_dict()` views and the corrupt variants a real DTO cannot express |
+
+### 13.12 Integration status
+
+* T20 is called by nothing in production: `git_commit` is exercised only by tests.
+* T21 is handed a T20 result explicitly and is called by nothing in production.
+* **T22 is a library with no caller**: `main.py` is byte-for-byte unchanged, no
+  orchestrator exists, `RunContext` remains deferred (F2), and T23+ is untouched.
+* T22 performs no Git/Sonar/Codex/network/filesystem mutation of any kind; it
+  consumes already-produced evidence only.
+
+### 13.13 Acceptance criteria
+
+1. **Given** the results of a completed T19/T20/T21 run for one issue, **when**
+   `build_overall_report` is called, **then** it returns an immutable,
+   deterministic, JSON-serializable, secret-free `OverallReport` and executes
+   nothing.
+2. **Given** `FIXED` + `COMMITTED` + `PUSHED` for every issue, **then** the status
+   is `SUCCESS`; **given** a `PUSH_UNVERIFIED`, `COMMIT_UNVERIFIED`, unknown
+   status, missing required evidence or contradictory evidence anywhere, **then**
+   the status is never `SUCCESS`.
+3. **Given** no entries, **then** the status is `EMPTY` with `is_valid = True` and
+   it is not `SUCCESS`.
+4. **Given** malformed, duplicate or unknown-status input, **then** the status is
+   `REVIEW_REQUIRED`, `is_valid` is `False`, the failed gate is named in
+   `validation_errors`, and no issue is classified (the counts are all zero and
+   `input_entries` still records the input size).
+5. **Given** a report that violates its own count/classification invariants,
+   **then** `verify_overall_report` reports it and the report is never returned as
+   valid.
 

@@ -183,6 +183,57 @@ class SonarAnalysisTriggerResult:
             "error": self.error,
         }
 
+    def evidence(self) -> "AnalysisTriggerEvidence":
+        """Project this result onto the minimal evidence later stages carry.
+
+        T19 puts the returned :class:`AnalysisTriggerEvidence` on its
+        ``IssueStatusResult`` and T20 cross-checks it against the T17
+        completion. Only the two facts that check needs leave T16; the captured
+        output, the exact argv and the exit code stay in this record, so nothing
+        bulky is duplicated into the T19/T20 results.
+        """
+        return AnalysisTriggerEvidence(triggered=self.triggered, task_id=self.task_id)
+
+
+@dataclass(frozen=True)
+class AnalysisTriggerEvidence:
+    """Minimal, immutable T16 evidence carried forward by T19 to T20.
+
+    T20's analysis-task gate has to prove that the compute-engine task the T17
+    completion waited on is the task *this* run triggered
+    (:func:`commit_policy._gate_analysis_task_id`). That cross-check needs
+    exactly two facts, so this compact record is what
+    :class:`issue_status.IssueStatusResult` carries - through
+    :meth:`SonarAnalysisTriggerResult.evidence` - instead of the whole trigger
+    result.
+
+    Attributes:
+        triggered: ``True`` only when the analysis was successfully *requested*
+            (``SonarAnalysisStatus.TRIGGERED``). It still never means the
+            analysis finished.
+        task_id: the compute-engine task id the trigger reported, or ``None``
+            when it could not be determined. A missing task id fails T20 closed.
+    """
+
+    # Not a pytest test class (see ``TestStatus`` in ``test_runner``).
+    __test__ = False
+
+    triggered: bool
+    task_id: Optional[str] = None
+
+    @property
+    def has_task_id(self) -> bool:
+        """True when a non-blank compute-engine task id was reported."""
+        return bool(self.task_id) and bool(str(self.task_id).strip())
+
+    def as_dict(self) -> dict:
+        """Secret-free summary (never the captured output, argv or environment)."""
+        return {
+            "triggered": self.triggered,
+            "task_id": self.task_id,
+            "has_task_id": self.has_task_id,
+        }
+
 
 #: A runner takes ``(args, cwd, env, timeout_seconds)`` and returns an object with
 #: ``returncode``/``stdout``/``stderr``, or raises ``OSError`` /
@@ -468,6 +519,7 @@ class SonarAnalysisTrigger:
 __all__: Sequence[str] = (
     "AnalysisConfig",
     "AnalysisRunner",
+    "AnalysisTriggerEvidence",
     "DEFAULT_TASK_ID_PATTERNS",
     "SonarAnalysisError",
     "SonarAnalysisStatus",

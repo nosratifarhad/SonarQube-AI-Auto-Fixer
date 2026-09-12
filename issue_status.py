@@ -69,6 +69,21 @@ completion is itself proof that a real compute-engine task was polled to a
 successful end, so that path stays safe. Supplying the T16 result is strictly
 stricter and is what the orchestration layer is expected to do.
 
+T16 evidence is carried forward, not consumed here
+--------------------------------------------------
+The T16 result is not discarded after classification. ``IssueStatusResult``
+carries the compact :class:`sonar_analysis.AnalysisTriggerEvidence` (the trigger
+outcome plus the compute-engine task id) in ``trigger_evidence``, so the
+provenance chain
+
+    T16 trigger  ->  T19 result (``trigger_evidence``)  ->  T20 commit gate
+
+is preserved at every hop. T20 cross-checks that task id against the T17
+completion's task id and **fails closed** when the evidence is absent,
+contradictory or mismatched. This module still tolerates ``trigger=None`` for
+*classification* (the T17-only row above); requiring the evidence is T20's
+decision, taken at the irreversible step.
+
 Scope boundary
 --------------
 This module is pure decision logic: no HTTP, no subprocess, no file access, no
@@ -85,7 +100,11 @@ from typing import Mapping, Optional, Sequence, Tuple
 from analysis_correlation import AnalysisCorrelation
 from change_scope import ChangeScopeResult
 from codex_result import CodexResultAnalysis
-from sonar_analysis import SonarAnalysisStatus, SonarAnalysisTriggerResult
+from sonar_analysis import (
+    AnalysisTriggerEvidence,
+    SonarAnalysisStatus,
+    SonarAnalysisTriggerResult,
+)
 from sonar_analysis_waiter import SonarAnalysisCompletion, SonarAnalysisState
 from sonar_issue_verification import SonarIssueVerificationResult
 from test_result import TestOutcome
@@ -315,6 +334,11 @@ class IssueStatusResult:
         tests: the T15 outcome that was used.
         analysis: the T17 completion that was used.
         verification: the T18 verification that was used.
+        trigger_evidence: the compact T16 evidence (task id + trigger outcome)
+            that was used, or ``None`` when no T16 result was supplied. T20
+            cross-checks it against ``analysis.task_id`` and fails closed when
+            it is absent, so the T16 - T19 - T20 provenance is preserved
+            instead of being dropped here.
     """
 
     __test__ = False
@@ -328,6 +352,7 @@ class IssueStatusResult:
     tests: TestOutcome
     analysis: SonarAnalysisCompletion
     verification: SonarIssueVerificationResult
+    trigger_evidence: Optional[AnalysisTriggerEvidence] = None
 
     @property
     def is_fixed(self) -> bool:
@@ -363,6 +388,11 @@ class IssueStatusResult:
             "tests": self.tests.as_dict(),
             "analysis": self.analysis.as_dict(),
             "verification": self.verification.as_dict(),
+            "trigger_evidence": (
+                self.trigger_evidence.as_dict()
+                if self.trigger_evidence is not None
+                else None
+            ),
         }
 
 
@@ -389,13 +419,17 @@ def determine_issue_status(
         trigger: optional T16 analysis-trigger result. Supplying it makes the
             analysis stage strictly stricter (a failed trigger, a missing task
             id, or a mismatched task id can never become anything but
-            ``ANALYSIS_FAILED``).
+            ``ANALYSIS_FAILED``). It is also projected onto the result's
+            ``trigger_evidence`` so T20 can cross-check the task id later; a
+            ``None`` leaves ``trigger_evidence`` ``None``, which T20 refuses.
 
     Returns:
         A typed :class:`IssueStatusResult`. ``FIXED`` is returned only when the
         original issue is reliably verified as absent after a successful,
         *correlated* analysis *and* every earlier precondition passed.
     """
+
+    trigger_evidence = trigger.evidence() if trigger is not None else None
 
     def decide(
         status: IssueFinalStatus, stage: str, reason: str, trail: list
@@ -410,6 +444,7 @@ def determine_issue_status(
             tests=tests,
             analysis=analysis,
             verification=verification,
+            trigger_evidence=trigger_evidence,
         )
 
     trail: list = []

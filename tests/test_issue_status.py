@@ -445,6 +445,7 @@ class TestPurityAndModel:
             "tests",
             "analysis",
             "verification",
+            "trigger_evidence",
         }
 
     @pytest.mark.parametrize(
