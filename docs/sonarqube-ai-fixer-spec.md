@@ -1,10 +1,11 @@
-# SonarQube AI Auto-Fixer — Domain & Behaviour Specification (T04–T25)
+# SonarQube AI Auto-Fixer — Domain & Behaviour Specification (T04–T26)
 
-Status: **POC implementation complete (T01–T25)** · T20 (safe, fail-closed,
+Status: **POC implementation complete (T01–T26)** · T20 (safe, fail-closed,
 exactly-one-commit Git commit), T21 (safe, fail-closed, exactly-one-push Git
-push of a T20 `COMMITTED` result), T22/T23 (the overall and per-issue reports)
-and T24/T25 (the max-issue / max-iteration policy limits) are implemented; none
-of them is wired into `main.py`, and T26+ is deliberately not implemented · No
+push of a T20 `COMMITTED` result), T22/T23 (the overall and per-issue reports),
+T24/T25 (the max-issue / max-iteration policy limits) and T26 (the standalone
+main/default branch-protection policy, §18) are implemented; none of them is
+wired into `main.py`, and T27+ is deliberately not implemented · No
 real SonarQube credentials and no real push are ever made by this tool (every
 T21 push targets a bare repository under `tmp_path`) · Tests never invoke a real
 Codex CLI, never need a real project toolchain, never need a live SonarQube
@@ -38,10 +39,12 @@ fix one SonarQube issue in a **local clone** of the analysed repository:
 16. classifies the attempt as `FIXED`, `STILL_OPEN`, `ANALYSIS_FAILED`,
     `TESTS_FAILED`, `SCOPE_INVALID`, `CODEX_FAILED` or `REVIEW_REQUIRED` (T19).
 
-T20–T25 (commits §11, pushes §12, reporting §13–§14 and the two policy limits
-§15–§16) are implemented and documented below. PR creation, retry/iteration
-**loops**, orchestration, branch/rule protection and container/CI wiring remain
-**out of scope** for this document and for the codebase. T16–T19 deliberately
+T20–T26 (commits §11, pushes §12, reporting §13–§14, the two policy limits
+§15–§16 and branch protection §18) are implemented and documented below. PR
+creation, retry/iteration **loops**, orchestration, branch/rule *enforcement*
+and container/CI wiring remain **out of scope** for this document and for the
+codebase — T26 decides whether a branch is safe to mutate but nothing enforces
+that decision yet, and it never touches Git. T16–T19 deliberately
 stop at *verifying and classifying* the attempt: nothing is committed, nothing
 is pushed, nothing is retried, no SonarQube issue is resolved or closed, and no
 source code is modified by these stages.
@@ -74,7 +77,8 @@ source code is modified by these stages.
 | — | Pre-T20 safety primitive: secret scan of a future commit's content | `secret_scan.py` | ✔ (primitive only, no commit) |
 | T20 | Safe, fail-closed, exactly-one-commit Git commit of a verified fix | `commit_message.py`, `commit_policy.py`, `git_commit.py` | ✔ |
 | T21 | Safe, fail-closed, exactly-one-push Git push of a T20 `COMMITTED` result | `push_policy.py`, `git_push.py` | ✔ |
-| T22+ | PRs, reporting, limits, retry loops, protection, CI | — | ✖ not implemented |
+| T22–T26 | Reporting (§13–§14), the two policy limits (§15–§16) and branch protection (§18) | `overall_report.py`, `per_issue_report.py`, `issue_limit.py`, `iteration_limit.py`, `branch_protection.py` | ✔ (none wired) |
+| T27+ | PRs, retry loops, orchestration, CI, containers | — | ✖ not implemented |
 
 ## 3. Actors and system context
 
@@ -1259,12 +1263,15 @@ Run: `.venv\Scripts\python -m pytest -q --cov=. --cov-report=term-missing`
 
 ## 10. Non-goals (unchanged for T22+)
 
-* No PR creation (T22+), no reporting beyond the T22 structured overall report
+* No PR creation (T27+), no reporting beyond the T22 structured overall report
   (§13) and the T23 per-issue report (§14), no retry or iteration **loops** and
   no orchestration. The T24/T25 limits (§15, §16) exist as pure policy modules
   only: they bound a run's issue selection and one issue's retry counter, but
-  nothing calls them and nothing loops. No branch/rule protection (T26–T28) and
-  no production logging, container, or GitLab CI wiring (T29–T32).
+  nothing calls them and nothing loops. T26 (§18) exists as a pure policy module
+  too: it decides whether a branch is safe to mutate, but it runs no Git
+  command, discovers no default branch, creates no branch and is called by
+  nothing. No branch/rule *enforcement* (T27+) and no production logging,
+  container, or GitLab CI wiring (T29+).
 * T20 performs exactly two Git writes and T21 exactly one (see §11, §12), and
   nothing else: they never push more than once, fetch, pull, clone, reset,
   restore, clean, stash, check out, switch, amend, retry, or write
@@ -2842,4 +2849,412 @@ True
   echo caller-authored text in a reason or a serialized view.
 * Neither is imported by `main.py`, T19–T23, or by the other one: T24 and T25 are
   independent, and `RunContext`/orchestration remain deferred.
+
+## 18. T26 — main/default branch protection (implemented policy layer, not wired)
+
+T26 answers exactly one question and nothing else:
+
+> "is this Git branch safe to mutate for an AI-generated SonarQube fix?"
+
+It is a **pure policy / decision layer**: it discovers nothing, runs no Git
+command, authenticates nothing and mutates nothing. `main.py` is byte-for-byte
+unchanged, T20/T21 keep their own inline branch gates (unchanged), and **nothing
+calls T26 yet**.
+
+| Module | Role | Side effects |
+|--------|------|--------------|
+| `branch_protection.py` | the immutable policy / input / verdict records, the branch-identity validation, the decision ladder and `as_dict()` | **none** |
+
+### 18.1 Purpose, scope and non-goals
+
+* **Purpose**: give a future orchestration layer one deterministic, fail-closed
+  answer to "may this branch receive an AI-generated commit or push?", so the
+  tool can never *accidentally* target `main`, `master`, `develop`, `trunk`, the
+  repository's own default branch or a malformed branch identity.
+* **In scope**: configuration validation (the protected set and the namespace
+  flag), candidate/default-branch identity validation, the protection decision,
+  the deterministic order of the checks, and the exact reason.
+* **Out of scope**: discovering the default branch (that needs Git, so it belongs
+  to orchestration — §18.4), creating/renaming/checking out a branch (T07 owns
+  branch creation), committing (T20, §11), pushing (T21, §12), retrying,
+  reporting (§13/§14), the limits (§15/§16) and `RunContext`.
+* **Trust boundary**: both inputs are **caller-asserted**; T26 authenticates
+  nothing and proves nothing (§18.11).
+
+### 18.2 Security model — three rules plus one identity requirement
+
+An AI-generated fix may never be committed to, or pushed to, a branch that is
+
+1. a **protected** name (default: `main`, `master`, `develop`, `trunk`) — §18.3;
+2. the repository's **default** branch, whatever it is called — §18.4;
+3. an **unusable branch identity** (missing, empty, whitespace-padded, malformed
+   or ref-like) — §18.6;
+
+and, by default, the candidate must additionally live inside the T07 AI-fix
+namespace `ai/sonar-fix/` — §18.5. A branch that clears every rule is allowed.
+
+| Rule | The question it answers |
+|------|-------------------------|
+| identity | "is this a real branch name at all?" |
+| protected set | "is this one of the names the operator protected?" |
+| default branch | "is this the branch the repository considers primary?" |
+| namespace | "was this branch created by T07 for this tool?" |
+
+| `candidate` | `default` | prefix | protected | Result |
+|-------------|-----------|--------|-----------|--------|
+| `main` | `main` | on | standard | `PROTECTED_BRANCH` |
+| `develop` | `main` | on | standard | `PROTECTED_BRANCH` |
+| `feature/x` | `main` | on | standard | `WRONG_BRANCH_NAMESPACE` |
+| `ai/sonar-fix/x` | `main` | on | standard | `ALLOWED` |
+| `ai/sonar-fix/x` | `ai/sonar-fix/x` | on | standard | `DEFAULT_BRANCH` |
+| `main/` | `main` | on | standard | `INVALID_BRANCH` |
+| `main` | *(missing)* | on | standard | `MISSING_DEFAULT_BRANCH` |
+| `ai/sonar-fix/x` | `main` | off | standard | `ALLOWED` |
+| `feature/x` | `main` | off | `("feature/x",)` | `PROTECTED_BRANCH` |
+| `feature/x` | `main` | off | `("main","MAIN")` | `INVALID_POLICY` |
+
+T26 judges one **already-existing** branch: it creates nothing, renames nothing,
+deletes nothing, checks nothing out and writes nothing — to Git or to any file.
+
+### 18.3 Protected branches
+
+`ProtectedBranchPolicy.protected_branches` defaults to `PROTECTED_BRANCH_NAMES` =
+`("main", "master", "develop", "trunk")` — the same four names T20/T21 use
+(§18.14 pins the equality). Requirements, all pinned by tests:
+
+* **immutable internally**: the policy is a frozen dataclass and
+  `protected_branch_keys` returns a fresh tuple of comparison keys, so an
+  evaluation can never change the configuration and the configuration can never
+  change an evaluation;
+* **ordered and deterministic**: the configured order is preserved and no set
+  decides a comparison — a `set`, `frozenset`, `Mapping`, bare `str` or `bytes`
+  is refused as `INVALID_POLICY` (it has no deterministic order);
+* `None` **never means "protect nothing"** — it is refused (`INVALID_POLICY`),
+  because an unstated protection set must not widen what may be mutated;
+* **an empty tuple is valid but strict**: it protects no *named* branch, while
+  the default-branch rule (always) and the namespace rule (by default) still
+  apply — so `main` with an empty set is still refused (`DEFAULT_BRANCH`), and
+  `main` with an empty set *and* another default branch is still refused
+  (`WRONG_BRANCH_NAMESPACE`);
+* every entry must be a **usable branch name** (§18.6), and **no two entries may
+  share a comparison key**: `("main", "MAIN")` is refused
+  (`protected_branches repeats 'main'`) instead of being silently deduplicated;
+* a malformed entry is named by **position** (`protected branch entry 2 ...`)
+  and the offending value itself is never echoed.
+
+### 18.4 The default branch (never inferred, never discovered)
+
+`BranchProtectionInput.default_branch` is the repository's actual default branch
+and is **supplied explicitly by the caller**. Every case is pinned:
+
+| `default_branch` | Result |
+|------------------|--------|
+| a usable name equal (case-folded) to the candidate | refused `DEFAULT_BRANCH` |
+| a usable name different from the candidate | not a refusal *for this reason* |
+| `None` | refused `MISSING_DEFAULT_BRANCH` |
+| `""`, whitespace-only, non-`str`, or a malformed/ref-like name | refused `MISSING_DEFAULT_BRANCH` |
+
+There is deliberately **no switch to disable the default-branch requirement**: a
+switch would turn missing information into permission to mutate, which is exactly
+what T26 exists to prevent. `default_branch=None` is a refusal, never "anything
+goes", and the default branch is never inferred from the candidate.
+
+T26 **never** runs `git symbolic-ref`, `git remote`, `git config`, `git branch`
+or `git ls-remote`, and never reads a ref file: discovering the default branch is
+a Git operation and therefore belongs to a future orchestration layer. T21's
+executor already resolves it from `refs/remotes/<remote>/HEAD`
+(`git_push.py::_resolve_default_branch`, local refs only, no network); an
+integration would compute it there, pass it to T26, and refuse to commit or push
+on any refusal.
+
+### 18.5 The AI-fix branch namespace
+
+T07 creates agent branches in `ai/sonar-fix/` (`branch_naming.AGENT_BRANCH_PREFIX`,
+re-exported by T26 as `AI_FIX_BRANCH_PREFIX`).
+`ProtectedBranchPolicy.require_ai_fix_branch_prefix` defaults to `True`, and then
+only a branch inside that namespace is eligible:
+
+| candidate | prefix required (`True`, default) | prefix disabled (`False`) |
+|-----------|-----------------------------------|---------------------------|
+| `ai/sonar-fix/x` | eligible | eligible |
+| `ai/sonar-fix/a/b` (nested, Git-valid) | eligible | eligible |
+| `ai/sonar-fix` (the bare prefix) | `WRONG_BRANCH_NAMESPACE` | eligible |
+| `feature/x`, `bugfix/x`, `user/x`, `ai/other/x`, `ai/sonar-fix2/x` | `WRONG_BRANCH_NAMESPACE` | eligible |
+| `AI/sonar-fix/x` (case variant) | `WRONG_BRANCH_NAMESPACE` | eligible |
+
+* The test is an **exact, case-sensitive** prefix followed by `/`, because Git
+  refs are case-sensitive and T07 only ever emits the lowercase prefix.
+  Protection comparison is case-*in*sensitive while namespace membership is not:
+  keeping membership case-sensitive makes T26 strictly stricter than T20/T21's
+  `is_agent_branch`, never looser (§18.14).
+* The namespace is **not a policy field**: it is the T07 constant. A configurable
+  namespace would be a way to widen what may be mutated, and T07 owns naming.
+* Disabling the requirement is an explicit operator opt-out: any valid branch
+  that is neither protected nor the default branch becomes eligible. It disables
+  nothing else — tests pin the protected/default/missing-default/invalid-policy
+  refusals with the flag off.
+* This is **not** a branch-creation policy: T26 evaluates an existing branch and
+  never creates, renames, deletes or checks out anything.
+
+### 18.6 Branch identity validation (one rule for every name)
+
+Every name T26 reads — the candidate, the default branch and each configured
+protected entry — must pass the *same* identity rule:
+
+1. it must be a `str` (`None`, `int`, `bool`, `float`, `bytes`, a collection …
+   are refused);
+2. it must be valid according to T07's `branch_naming.validate_branch_name`,
+   which mirrors `git check-ref-format` and additionally rejects `HEAD`, `@` and
+   a leading `-`;
+3. it must not be **ref-like**: a value starting with `refs/` names a reference,
+   not a branch, so its identity is ambiguous and it is refused.
+
+Refused at minimum (every case pinned by a test): `None`; empty and
+whitespace-only; leading or trailing whitespace (**never trimmed** — an identity
+with padding is refused, not silently rewritten); `..`; a trailing `.`; a
+trailing `.lock`; a component beginning with `.`; `//`; a leading `-`; `/` at
+either end; `@{`; `HEAD`; `@`; every forbidden ref character (space, `~`, `^`,
+`:`, `?`, `*`, `[`, `\`) and every control character including NUL; and
+`refs/...`.
+
+Names that are **not** refused: anything T07's validator accepts and that is not
+ref-like — including `release/1.0`, `a/b/c`, `origin/main` (a *different* branch
+from `main`, never a suffix match) and `ai/sonar-fix/a/b`. T26 performs **no
+substring, prefix or suffix matching** for protection: only the whole comparison
+key is compared.
+
+The comparison key is `name.strip().casefold()`, applied identically to the
+candidate, the default branch and every protected entry. The trim is idempotent
+for every name that reaches a comparison (a padded name was refused first), and a
+key is used **for comparison only** — T26 never rewrites a branch name. That is
+precisely what makes `main`, `MAIN`, `Main` and `main/` all unusable as mutation
+targets.
+
+### 18.7 The contract
+
+```python
+ProtectedBranchPolicy(protected_branches=PROTECTED_BRANCH_NAMES,
+                      require_ai_fix_branch_prefix=True)       # configuration
+BranchProtectionInput(candidate_branch=None,
+                      default_branch=None)                     # caller facts
+evaluate_branch_protection(*, policy, branch) -> BranchProtectionEvaluation
+```
+
+`policy_version` is `t26.1`. The module exposes `POLICY_VERSION`,
+`PROTECTED_BRANCH_NAMES`, `AI_FIX_BRANCH_PREFIX`, `ALLOWED_STATUSES`,
+`PRECEDENCE`, `BranchProtectionStatus`, `BranchProtectionDecision`,
+`ProtectedBranchPolicy`, `BranchProtectionInput`, `BranchProtectionEvaluation`
+and `evaluate_branch_protection` — and it imports the standard library plus the
+pure T07 validator `branch_naming`, nothing else.
+
+### 18.8 Statuses
+
+| Status | Meaning |
+|--------|---------|
+| `ALLOWED` | the branch may receive an AI-generated fix |
+| `PROTECTED_BRANCH` | the branch is one of the configured protected names |
+| `DEFAULT_BRANCH` | the branch **is** the repository's default branch |
+| `INVALID_BRANCH` | the candidate is not a usable branch identity |
+| `INVALID_POLICY` | the protection configuration is not usable |
+| `MISSING_DEFAULT_BRANCH` | no usable default branch was supplied |
+| `WRONG_BRANCH_NAMESPACE` | the branch is outside `ai/sonar-fix/` while required |
+
+`BranchProtectionDecision` is `ALLOW` only for `ALLOWED_STATUSES`
+(`(ALLOWED,)`) and `REFUSE` for every other status, so a refusal can never report
+`allowed == True` and an allowed verdict can never carry a refusal status.
+
+### 18.9 Precedence (explicit, documented and pinned)
+
+`PRECEDENCE` is the authoritative order; the first applicable status decides:
+
+1. `INVALID_POLICY` — a policy that cannot state what is protected refuses
+   before anything else is considered;
+2. `INVALID_BRANCH` — an unusable candidate is refused before any classification;
+3. `MISSING_DEFAULT_BRANCH` — without a default branch the candidate cannot be
+   shown to differ from it;
+4. `PROTECTED_BRANCH`;
+5. `DEFAULT_BRANCH`;
+6. `WRONG_BRANCH_NAMESPACE`;
+7. `ALLOWED`.
+
+**The documented hard case**: `candidate="main"` with `default_branch=None` is
+refused as `MISSING_DEFAULT_BRANCH`, **not** as `PROTECTED_BRANCH` — the missing
+precondition is reported first, exactly as T24 checks its configuration before
+its evidence. The branch is refused either way, so the choice affects only the
+reported reason, and it is pinned by a test
+(`test_a_missing_default_branch_takes_precedence_over_protected`).
+
+The tests pin one conflict per adjacent pair, e.g. invalid policy beats an
+invalid candidate; an invalid candidate beats a missing default branch;
+`MISSING_DEFAULT_BRANCH` beats both `PROTECTED_BRANCH` and
+`WRONG_BRANCH_NAMESPACE`; `PROTECTED_BRANCH` beats `DEFAULT_BRANCH` (a branch can
+be both); `DEFAULT_BRANCH` beats `WRONG_BRANCH_NAMESPACE`.
+
+### 18.10 Fail-closed behaviour
+
+| Input | Result |
+|-------|--------|
+| `protected_branches=None` | `INVALID_POLICY` — never "protect nothing" |
+| unusable protected set (`str`/`bytes`/`set`/`mapping`/other) | `INVALID_POLICY` |
+| malformed or duplicate protected entry | `INVALID_POLICY` |
+| `require_ai_fix_branch_prefix` not a real `bool` | `INVALID_POLICY` |
+| unusable candidate | `INVALID_BRANCH` |
+| unusable or absent default branch | `MISSING_DEFAULT_BRANCH` |
+| protected candidate (any case or spacing) | `PROTECTED_BRANCH` / `INVALID_BRANCH` |
+| candidate equal to the default branch (any case) | `DEFAULT_BRANCH` |
+| candidate outside `ai/sonar-fix/` while required | `WRONG_BRANCH_NAMESPACE` |
+| otherwise | `ALLOWED` |
+
+There is no "probably safe" outcome and no configuration that turns T26 into
+"always allowed": with `protected_branches=()` *and*
+`require_ai_fix_branch_prefix=False` the only remaining rule is the default
+branch, which is still enforced (pinned by
+`test_the_default_branch_rule_cannot_be_configured_away`). A `TypeError` is raised
+only when a caller passes something that is not one of the two records — a
+programming error, not evidence.
+
+### 18.11 Trust boundary
+
+Documented in the module and pinned by a test. T26 **is** a policy decision layer
+and it **does not**:
+
+* authenticate the caller, the branch or any evidence — both inputs are
+  caller-asserted;
+* discover the repository's default branch (§18.4); a future integration does
+  that, and T26 trusts the value it is handed;
+* prove the branch exists locally or remotely, or that it is the checked-out
+  branch;
+* mutate Git, the filesystem, the environment or any global state;
+* prevent a malicious caller from bypassing the policy by simply not calling it.
+
+Future orchestration must enforce the returned verdict; T26 cannot enforce
+anything by itself. This is intentional and is the same "policy boundary, not an
+evidence-authentication boundary" distinction §14.2/§15.1 document for T23/T24.
+
+### 18.12 Purity and no Git I/O
+
+`branch_protection.py` accesses no filesystem, no network, no subprocess, no Git
+and no configuration file; it mutates no global state, keeps no counter and no
+cache, and reads its inputs only from its two arguments. It builds no shell
+command and no argv. The tests assert this three ways: the module's imports are
+exactly `__future__`, `dataclasses`, `enum`, `typing` and `branch_naming`; the
+module's AST references none of `subprocess`/`socket`/`open`/`eval`/`exec`/
+`print`/`input`/`__dict__`/`getattr`/`setattr`, and its source contains no Git
+subcommand string; and an evaluation still succeeds with `builtins.open` and
+`pathlib.Path.open` replaced by an exception, and with `GIT_DIR`/`DEFAULT_BRANCH`
+set in the environment.
+
+### 18.13 The result DTO, determinism and secret safety
+
+`BranchProtectionEvaluation` is frozen and carries `policy_version`, `status`,
+`decision`, `candidate_branch`, `default_branch`, `branch_in_ai_namespace`,
+`branch_is_default`, `branch_is_protected`, `reason`, `reasons` and `policy`.
+`is_allowed` is a **property derived from `status`** (never a stored field), so
+the invariant `is_allowed == (status is ALLOWED)` cannot be broken by
+construction — there is no second source of truth to diverge.
+
+The three booleans are *facts about the inputs*, not restatements of the status:
+a branch can be both protected and the default branch (`develop` with
+`default_branch="develop"` is `PROTECTED_BRANCH` with `branch_is_default is True`
+as well), and `PRECEDENCE` names only the first applicable refusal. The pinned
+implications are: `ALLOWED ⇒ ¬protected ∧ ¬default ∧ (in namespace ∨ rule off)`;
+`PROTECTED_BRANCH ⇒ branch_is_protected`; `DEFAULT_BRANCH ⇒ branch_is_default ∧
+¬branch_is_protected`; `INVALID_BRANCH ⇒ candidate_branch is None`;
+`MISSING_DEFAULT_BRANCH ⇒ default_branch is None`.
+
+`as_dict()` is JSON-native, deterministic (same keys, same order, same values on
+every call) and **publishes only validated values**: a name that failed
+validation is `None`, an unusable protected set is `None`, a non-bool flag is
+`None`, and a refusal reason names the *type* or the T07 rule instead of echoing
+the value (a forbidden character can appear only through its `repr`, e.g.
+`'\x00'`). The only caller text that can ever be published is a **validated** Git
+branch name — a ref, not arbitrary text — and T26 emits no command, no argv and
+no environment, so nothing in the mapping can be executed. Tests prove a decoy
+secret placed in an invalid candidate, an invalid protected set and an invalid
+flag never reaches a reason or a serialized view.
+
+Repeated evaluation of the same pair returns an **equal** record with a
+byte-for-byte identical `as_dict()`, no caller value is mutated (including a
+caller-supplied list of protected names), and no state is kept between calls.
+
+### 18.14 Compatibility with T20/T21 (no contradiction, and the differences)
+
+T26 is the standalone formalisation of the branch rule T20/T21 already apply
+inline (`commit_policy.py::_gate_branch_safe`, gate `G32`, and T21's `G14`/`G28`).
+It **changes neither module**: no T20/T21 file was touched, neither imports T26,
+and the compatibility tests only *read* them.
+
+Same values: `PROTECTED_BRANCH_NAMES` (`main`, `master`, `develop`, `trunk`) and
+the `ai/sonar-fix` namespace are identical in T07, T20, T21 and T26, and a test
+pins all four to each other. Safety direction: **a T26 allow never widens a T20
+allow** (pinned over a matrix of branch names) — T26 can only ever be stricter.
+
+| Behaviour | T20/T21 | T26 | Effect |
+|-----------|---------|-----|--------|
+| `default_branch=None` | "no extra branch is protected"; the executor resolves the real default branch first | refused `MISSING_DEFAULT_BRANCH` | T26 is stricter |
+| a padded name (`" main"`) | stripped, then compared — so `" main"` counts as protected | refused as an invalid identity | both refuse; only the *reason* differs |
+| `required_branch_prefix` | any truthy value enables the rule | must be a real `bool` | T26 is stricter |
+| namespace membership | `startswith(prefix + "/")`, case-sensitive | same, case-sensitive | identical |
+| protection comparison | strip + `casefold` | strip + `casefold`, one key for every name | identical |
+| the default branch | merged into `is_protected_branch` | a separate `DEFAULT_BRANCH` status and separate booleans | a reporting difference, never a widening |
+
+The only semantic differences are *stricter* in T26 (a missing default branch is
+a refusal, a padded identity is refused, the flag must be a bool); none of them
+loosens a T20/T21 rule, so T20/T21 behaviour is unchanged and uncontradicted.
+
+### 18.15 Tests
+
+| Test file | Covers |
+|-----------|--------|
+| `tests/test_branch_protection.py` | policy configuration (default set, custom set, empty set, `None`, `str`/`bytes`/`set`/`frozenset`/`mapping`/scalar sets, malformed entries, duplicate normalized entries, non-`bool` flags, frozen records, the non-configurable namespace), candidate validation (all 43 pinned invalid identities and the valid ones), protection (all four names, case and whitespace variants, slashed names, no pattern/substring matching, unusable sets), the default branch (equal/different/case-folded/invalid/missing/itself protected/outside the set), the AI namespace (valid, nested, bare prefix, near-prefix, case variants, malformed prefix, disabled requirement), the exact `PRECEDENCE` plus one conflict per adjacent pair and a 455-case candidate × default × policy matrix, the result invariants (`is_allowed == (status is ALLOWED)`, no refusal reports allowed, `ALLOWED ⇒ ¬protected ∧ ¬default ∧ (namespace ∨ off)`), determinism, repeated evaluation, caller-value safety, frozen records, exact and JSON-native serialization, secret safety (decoys in an invalid candidate, set and flag), the helper tables, the T07/T20/T21 compatibility pins and documented differences, and the module surface (exact `__all__`, imports = stdlib + `branch_naming`, no I/O/execution/orchestration module, no Git command string, no branch-mutating API, exactly two keyword-only parameters, trust-boundary documentation) |
+
+`branch_protection.py` is at **100% statement and 100% branch coverage** from the
+focused run (`pytest tests/test_branch_protection.py --cov=branch_protection
+--cov-branch`): 147 statements, 38 branches, 0 missing, 0 partial. The file
+contains 343 tests; adding `tests/test_branch_naming.py` (386 tests) still
+reports 100% for both modules.
+
+### 18.16 Integration status — and `main.py` remains unwired
+
+* **T26 is a library with no caller.** `main.py` is byte-for-byte unchanged, no
+  production path imports `branch_protection`, and neither T20 nor T21 depends on
+  it: `commit_policy.py`, `push_policy.py`, `git_commit.py` and `git_push.py` are
+  untouched and keep their own inline branch gates.
+* The module imports the standard library plus the pure T07 validator
+  `branch_naming`; it has no dependency on T19–T25, no Git, no subprocess, no
+  network and no configuration file, so nothing about the existing pipeline can
+  change because of it.
+* T26 is a policy boundary only: it is **not** orchestration, it executes no
+  Git/SonarQube/Codex operation, and it performs no branch mutation.
+* A future integration would: resolve the default branch through T21's executor
+  (`_resolve_default_branch`, local refs only), pass it together with the
+  checked-out branch to `evaluate_branch_protection`, and refuse to stage,
+  commit or push on any refusal. That wiring is deliberately **not** part of T26 —
+  T26 must be independently testable first, and no orchestration is created
+  prematurely.
+
+### 18.17 Acceptance criteria
+
+1. **Given** a candidate equal to a protected name in any case (or a padded
+   variant of one), **then** the verdict is `PROTECTED_BRANCH` (or
+   `INVALID_BRANCH` for the padded form) and `is_allowed` is `False`.
+2. **Given** a candidate equal (case-folded) to the supplied default branch,
+   **then** the verdict is `DEFAULT_BRANCH`, whatever the branch is called.
+3. **Given** no usable default branch, **then** every candidate is refused with
+   `MISSING_DEFAULT_BRANCH`; `None` is never read as "there is no default branch".
+4. **Given** an unusable candidate (missing, empty, padded, malformed,
+   ref-like), **then** the verdict is `INVALID_BRANCH` and the value is never
+   trimmed, repaired or rewritten.
+5. **Given** an unusable protected set, a malformed or duplicate entry, or a
+   non-`bool` namespace flag, **then** every candidate is refused with
+   `INVALID_POLICY`.
+6. **Given** a valid, non-protected, non-default candidate outside the namespace
+   while the requirement is enabled, **then** the verdict is
+   `WRONG_BRANCH_NAMESPACE`.
+7. **Given** `ai/sonar-fix/<x>` and a default branch that differs from it,
+   **then** the verdict is `ALLOWED`.
+8. **Given** identical inputs, **then** the verdict is equal, `as_dict()` is
+   byte-for-byte identical and no caller value (policy, input, list) changed.
+9. **Given** any inputs, **then** the policy performs no I/O, no Git operation
+   and no branch mutation, and constructs no command.
 
