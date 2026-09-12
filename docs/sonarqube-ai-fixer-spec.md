@@ -1978,3 +1978,282 @@ gate verdicts and the phase trail. `report_version` is `t22.1`.
    **then** `verify_overall_report` reports it and the report is never returned as
    valid.
 
+
+## 14. T23 — per-issue report (implemented, not wired)
+
+T23 answers one question: *what exactly happened to THIS SonarQube issue?* It is a
+**pure reporting layer** over the evidence one issue's lifecycle already produced:
+
+```
+SonarIssue (T04/T08) + T19 IssueStatusResult -> T20 CommitResult -> T21 PushResult
+                                             -> T23 PerIssueReport
+```
+
+T22 aggregates many issues; T23 explains exactly one. They are independent
+reporting layers: T22 does not depend on T23, T23 does not depend on T22 (and
+neither one is imported by the other).
+
+| Module | Role | Side effects |
+|--------|------|--------------|
+| `per_issue_report.py` | immutable input/result DTOs, the state machine, the 21 gates, the derivation, `as_dict()`/`serialize_report` | **none** |
+
+### 14.1 Purpose, scope and non-goals
+
+* T23 consumes the `SonarIssue` identity plus the results of T19/T20/T21 for **one**
+  issue; it never produces evidence itself and never decides whether an issue
+  *should* have been fixed.
+* It runs **no** Git command, no SonarQube call, no Codex run, no project test, no
+  subprocess, no network request, and it never touches the filesystem or a
+  repository. The module imports `json` and `re` plus the production evidence
+  modules only, and projects the results through the same `as_dict()` views
+  T21/T22 use (never `asdict()`, never a private attribute, never a `repr()`).
+* It never rewrites a source status: `t19_status`, `t20_status` and `t21_status`
+  are the stages' own values, published verbatim next to the derived outcome.
+* **It is not wired into `main.py`**: `main.py` is byte-for-byte unchanged.
+* It does **not** implement T24–T25 (limits), T26–T28 (protections), T29–T32
+  (logging/containers/CI), it introduces no `RunContext`, and it adds no
+  orchestration, no policy object, no email/HTML/Markdown reporting and no
+  dashboard.
+
+### 14.2 Inputs
+
+```python
+PerIssueInput(issue_key, issue=None, issue_status=None,
+              commit_result=None, push_result=None)
+```
+
+`issue` is the real `models.SonarIssue` (or a mapping carrying exactly its eight
+fields) — the T04/T08 identity record T23 reports as `rule`, `file_path`,
+`line`, `severity`, `issue_type` and `message`. `issue_status`/`commit_result`/
+`push_result` are the production DTOs **or** their `as_dict()` views; `None` means
+the stage produced no result.
+
+`build_per_issue_report(entry=..., forbidden_secrets=...)` accepts a
+`PerIssueInput` **or** a mapping that carries exactly `issue_key`, `issue`,
+`issue_status`, `commit_result`, `push_result` (an unknown field is refused, so a
+duck-typed blob cannot slip through). A value that is neither is a fail-closed
+refusal (`G1`), never a guess. `forbidden_secrets` that is a bare string or not
+an iterable raises `PerIssueReportError` (a caller error, not evidence).
+
+**Trust boundary.** T23 accepts the production result DTOs **or** their projected
+`as_dict()` mappings, and it treats the statuses those records carry as
+*caller-asserted evidence*: it never re-runs T19/T20/T21, and it never
+authenticates the provenance of a mapping. What it validates is the supplied
+evidence's own internal consistency, its lifecycle consistency and its cross-stage
+coherence — so T23 is a **validation/reporting boundary, not an
+evidence-authentication boundary**, and a fully self-consistent fabricated mapping
+can technically satisfy it. That does not weaken the contract: `SUCCESS` still
+requires `FIXED` + `COMMITTED` + `PUSHED` with every gate passing, so no fabricated
+report is ever a *cheaper* success than the evidence it mimics. A future
+orchestration or security layer that needs trusted provenance remains responsible
+for establishing it outside T23.
+
+### 14.3 The state machine (S0-S10; a failure stops the run)
+
+| Phase | Gates | Invariant established |
+|-------|-------|-----------------------|
+| S0 `INPUT` | — | the input container was received |
+| S1 `INPUT_VALIDATED` | G1 | the input is a usable per-issue input |
+| S2 `ISSUE_IDENTITY_VALIDATED` | G2, G3 | the issue identity is safe and unambiguous |
+| S3 `T19_VALIDATED` | G4, G5 | the T19 result is usable |
+| S4 `T20_VALIDATED` | G6, G7 | the T20 result is usable (or absent) |
+| S5 `T21_VALIDATED` | G8, G9 | the T21 result is usable (or absent) |
+| S6 `CROSS_STAGE_CONSISTENCY_CHECKED` | G10-G15 | the T19/T20/T21 evidence is not contradictory |
+| S7 `DERIVED_OUTCOME_RESOLVED` | — | the outcome is derived from the evidence |
+| S8 `REPORT_BUILT` | G16-G19 | the built report satisfies its own invariants |
+| S9 `REPORT_VERIFIED` | G20, G21 | the report is JSON-safe and secret-free |
+| S10 `COMPLETE` | — | the report is returned |
+
+The trail is part of the report (`PerIssueReportState.stage_records`,
+`reached_phases`, `phase`, `failed_phase`, `gates`, `status_of`, `first_failure`).
+Every gate is **always** present: a gate whose phase did not run is
+`NOT_REACHED`, a phase failure never lets a later phase run, and `phase` is always
+the last *completed* phase while `failed_phase` is the phase that aborted the
+report (so `failed_phase` never appears in `reached_phases`). `GATE_PHASE` is the
+executable record of the ownership, and it runs in declaration order.
+
+### 14.4 The 21 gates (G1-G21)
+
+| Gate | Checks |
+|------|--------|
+| G1 | the input is a `PerIssueInput` or a mapping of exactly the input contract's fields (not `None`, a bare string, a number or an unknown-field blob) |
+| G2 | the declared key is a safe, non-empty, ≤100-character SonarQube-shaped key, and the issue record is a `SonarIssue`/mapping of exactly its eight fields with a usable `key`, `rule`, `component` and a strictly positive `line` (when set); `severity`/`issue_type`/`status`/`message` must be single-line, control-character-free, ≤400-character text when present |
+| G3 | the declared key and the issue record name the same issue |
+| G4 | the T19 result projects to a mapping with a well-formed `status`, boolean `is_fixed`/`needs_review` flags and well-formed nested evidence: a mapping `verification` (booleans, `original_issue_key` text, a recognised `match_type`/`correlation`), a mapping `analysis` (a recognised completion `status` and `task_id`), a mapping `trigger_evidence` (a boolean `triggered` and `task_id`), and boolean `scope`/`tests`/`codex` blocks |
+| G5 | the T19 `status` is one of the seven production `IssueFinalStatus` values |
+| G6 | a supplied T20 result projects to a mapping with a well-formed `status`, boolean flags, full-commit-id `new_head`/`commit_sha`/`previous_head` when present, a mapping `commit_message` (text `issue_key`), a mapping `repository` (text `branch`) and a mapping `gates` whose `first_failure` is a `G<number>` identifier |
+| G7 | a supplied T20 `status` is one of the four production `CommitStatus` values |
+| G8 | a supplied T21 result projects to a mapping with a well-formed `status`, boolean `is_pushed`/`is_refusal`/`needs_attention`/`push_attempted`, full-commit-id `expected_commit`/`remote_before_commit`/`remote_after_commit` when present, text `branch`/`remote_branch`/`refspec`, a mapping `remote` (text `name`, boolean `exists`) and a `gates.first_failure` |
+| G9 | a supplied T21 `status` is one of the four production `PushStatus` values |
+| G10 | the T19 result agrees with itself: the flags match the status, `reliable_absence` follows from its own inputs, the verification key matches the reported issue, and a `FIXED` result cannot coexist with negative Codex/scope/test/verification evidence, an open issue, an uncorrelated snapshot, a failed analysis or an unidentifiable trigger (each terminal failure status is checked against the one piece of evidence that must not say the opposite) |
+| G11 | T20 agrees with itself: `is_committed`/`needs_attention` match the status, and a `COMMITTED` result carries `new_head == commit_sha` and `new_head != previous_head` |
+| G12 | T21 agrees with itself: `is_pushed`/`is_refusal`/`needs_attention`/`push_attempted` match the status, and a `PUSHED` result was attempted, carries the commit it pushed, and reports a final remote tip equal to `expected_commit`; when both the before and after remote tips are supplied, they must differ (a verified push that did not move the remote is a contradiction, while an absent `remote_before_commit` is not) |
+| G13 | a push attempt is rooted in a `COMMITTED` T20 result with a usable id and names exactly the commit T20 created; the T20 commit message names the reported issue |
+| G14 | the branch and remote evidence is coherent: the T20 and T21 branches agree, the refspec matches its source and destination branches, and a push attempt carries a refspec and an existing remote |
+| G15 | the lifecycle order is respected: no T21 result without the T20 result it consumes, and no commit claimed for an issue T19 did not verify as fixed (a refusal or a failed commit *is* coherent with a non-`FIXED` T19 and stays reportable) |
+| G16 | the published `issue_fixed` follows from the published T19 status |
+| G17 | the published `change_committed` follows from the published T20 status |
+| G18 | the published `change_pushed` follows from the published T21 status |
+| G19 | the published outcome, `end_to_end_success`, `needs_attention`, report version and gate catalogue all follow from the evidence (independently recomputed) |
+| G20 | the payload is plain JSON data and survives a `json.dumps`/`json.loads` round trip |
+| G21 | the serialized report matches none of the caller's configured secrets (and no credential-bearing URL) |
+
+An unrecognised status, a malformed result, a contradiction, a broken derivation,
+an unserializable payload and a secret are all **refusals**: they are never
+silently counted, never repaired and never mapped onto the nearest status.
+
+### 14.5 Lifecycle outcome semantics
+
+| `PerIssueOutcome` | Meaning |
+|-------------------|---------|
+| `SUCCESS` | `FIXED` + `COMMITTED` + `PUSHED`, and every gate passed |
+| `FAILED` | T19 definitively did not verify a fix (`STILL_OPEN`, `ANALYSIS_FAILED`, `TESTS_FAILED`, `SCOPE_INVALID`, `CODEX_FAILED`) |
+| `NOT_COMPLETED` | the fix was verified, but the lifecycle did not reach the end |
+| `REVIEW_REQUIRED` | the evidence is ambiguous — or the whole report is invalid |
+
+`issue_fixed`, `change_committed` and `change_pushed` stay separate: `FIXED` is
+not `COMMITTED`, `COMMITTED` is not `PUSHED`, and `end_to_end_success` is `True`
+only for `SUCCESS`. A `COMMIT_UNVERIFIED`/`PUSH_UNVERIFIED` result is always
+`REVIEW_REQUIRED`, never a success and never a failure. `needs_attention` is
+`True` for `REVIEW_REQUIRED` and `NOT_COMPLETED`, and also whenever the T20/T21
+result's own `needs_attention` flag is `True`; a definite `FAILED` does not need a
+human (T19 already decided it).
+
+### 14.6 Missing evidence, ambiguity and the source statuses
+
+A stage that produced no result is reported as **not executed**, and is never
+assumed to have succeeded or to have been refused:
+
+* `t20_status`/`t21_status` are `None`, `commit_result_supplied`/
+  `push_result_supplied` are `False`, the matching `reasons` line says the stage
+  supplied no result, and the phase trail records "not executed";
+* a `FIXED` issue whose commit or push stage produced no result is
+  `NOT_COMPLETED` — never `SUCCESS`, and never a definite `FAILED` either, because
+  the absence is unambiguous but proves nothing about what the stages did;
+* an *ambiguous* stage (`REVIEW_REQUIRED`, `COMMIT_UNVERIFIED`,
+  `PUSH_UNVERIFIED`) is `REVIEW_REQUIRED`.
+
+An invalid report is the strongest fail-closed state: `outcome` is
+`REVIEW_REQUIRED`, `is_valid` is `False`, `needs_attention` is `True`, **no**
+per-stage status is published (all three are `None`), every derived flag is
+`False`, and `validation_errors` names the failed gates. The only facts such a
+report keeps are the *validated* issue identity fields, so it still says which
+issue it is about; an identity that could not be validated (or that could not be
+proven secret-free) is published blank (`issue_key=""`, every other field `None`).
+
+### 14.7 Cross-stage consistency (the lifecycle cases)
+
+| Case | Evidence | T23 |
+|------|----------|-----|
+| A | `FIXED` + `COMMITTED` + `PUSHED` | `SUCCESS`, `end_to_end_success = True` |
+| B | `FIXED` + `COMMITTED` + `PUSH_UNVERIFIED` | `REVIEW_REQUIRED` (never `SUCCESS`) |
+| C | `FIXED` + `COMMIT_UNVERIFIED` | `REVIEW_REQUIRED` |
+| D | `FIXED` + `REFUSED` / `COMMIT_FAILED` | `NOT_COMPLETED` |
+| E | `STILL_OPEN` (or any definite failure) + `REFUSED` | `FAILED`, both statuses preserved verbatim |
+| F | `FIXED` + no T20 result | `NOT_COMPLETED` (never an assumed commit) |
+| G | `FIXED` + `COMMITTED` + no T21 result | `NOT_COMPLETED` (never an assumed push) |
+| H | `push.expected_commit != t20.new_head` | G13 → refused |
+| I | `remote_after_commit != expected_commit` | G12 → refused |
+| J | `COMMITTED` without a usable `new_head`/`commit_sha` | G11 → refused |
+| K | T21 push evidence although T20 did not verify a commit | G13 → refused |
+| L | T21 evidence without any T20 result | G15 → refused |
+| M | a commit claimed for an issue T19 did not verify as fixed | G15 → refused |
+| N | a T20/T21 result whose flags contradict its status | G11/G12 → refused |
+
+No contradiction is ever resolved by choosing the more optimistic reading, and no
+result is ever rewritten: the source statuses are preserved verbatim in every
+report.
+
+### 14.8 Determinism, serialization and secret safety
+
+* The same evidence always produces the same report, the same `as_dict()` and the
+  same `serialize_report()` text. Gate problems are de-duplicated and sorted per
+  gate; there is no timestamp, no random id and no unordered iteration anywhere in
+  the output; the issue identity is reported verbatim.
+* `as_dict()` returns only approved report fields as plain JSON data
+  (str/int/bool/None/list/dict), so `json.dumps(report.as_dict())` always works.
+  `serialize_report()` is canonical (`sort_keys=True`, no cosmetic whitespace).
+* **Secret safety is structural**: T23 is built by explicit field projection and
+  never copies free-form upstream text — no T19/T20/T21 reasons, no stage trails,
+  no gate reasons, no remote URLs, no captured output. The only *unclassifiable*
+  free-form field it publishes is the Sonar issue `message`, which is bounded
+  (≤400 characters), single-line and control-character-free. The other externally
+  supplied identity/status fields it publishes (`rule`, `component`, `severity`,
+  `issue_type`) and the Sonar `status` it validates (`G2`) are bounded and
+  validated in exactly the same way, but they are classified values — rule ids,
+  component names, severities, types and statuses — rather than free-form text;
+  `line` is a strictly positive integer. `G21` then scans the *serialized* report
+  against the caller's configured secrets (`forbidden_secrets`, normally
+  `AnalysisConfig.secrets`) plus URL-userinfo shapes, and a match refuses the
+  report — and because a failure report skips the serialization gates, the
+  identity is only published on that path when it can be proven secret-free (a
+  credential-bearing identity is dropped and the reason is recorded). No message,
+  gate reason or validation error ever echoes the offending value.
+* An unexpected internal error is converted into the same fail-closed refusal
+  (naming only the exception *type*), never into a success and never into a
+  traceback.
+
+### 14.9 Output DTO
+
+```python
+PerIssueReport(
+    outcome, is_valid, needs_attention,
+    issue_key, rule, file_path, component, line, severity, issue_type, message,
+    t19_status, t20_status, t21_status,
+    verification, analysis,
+    commit_sha, previous_head, branch, commit_message_issue_key,
+    t20_gate_failure, commit_needs_attention,
+    expected_commit, remote_before_commit, remote_after_commit,
+    remote_branch, remote, refspec, t21_gate_failure, push_needs_attention,
+    issue_fixed, change_committed, change_pushed, end_to_end_success,
+    reasons, validation_errors, state, report_version,
+)
+```
+
+`VerificationEvidence` carries the T18 evidence (`issue_key`,
+`retrieval_succeeded`, `is_present`, `identity_reliable`, `page_complete`,
+`reliable_absence`, `match_type`, `correlation`); `AnalysisEvidence` carries the
+T17/T16 analysis evidence (`completion_status`, `completion_task_id`, `triggered`,
+`trigger_task_id`). `commit_result_supplied`/`push_result_supplied`, `is_fixed`
+and `generated_from` are derived, so they can never disagree with the statuses.
+Every DTO is a frozen dataclass with tuple sequences; `state` carries all 21 gate
+verdicts and the phase trail. `report_version` is `t23.1`.
+
+### 14.10 Test mapping
+
+| Test file | Covers |
+|-----------|--------|
+| `tests/test_per_issue_report.py` | the success path and every derived state, every T19/T20/T21 status and the outcome each implies, missing T20/T21 evidence, unknown statuses, malformed and ambiguous identities, every cross-stage contradiction (G10-G15) including conflicting commit ids, conflicting T20/T21 evidence and invalid branch/remote evidence, the derivation seams (G16-G19) and the serialization/secret gates (G20/G21), canonical serialization, secret safety (a configured secret, a credential URL and their failure-path dropping), immutability, determinism, the full state machine, a matrix that exercises every fail-closed gate, and the **real** `GitCommitExecutor`/`GitPushExecutor` handoff in a `tmp_path` clone (a report built from genuine DTOs, with the repository provably untouched afterwards) |
+| `tests/test_per_issue_report_policy.py` | gate catalogue and `GATE_PHASE` integrity (including that a failure leaves every later phase's gates `NOT_REACHED`), the outcome ladder and its 112-combination sweep, the field/reader/payload helpers, the failure-report contract, the gate bookkeeping, the module surface, and an AST check that the module's code references no execution primitive |
+| `tests/t23_fixtures.py` | non-collected fixtures: real T19 statuses, real T20/T21 DTOs, a real `SonarIssue`, their `as_dict()` views and the corrupt variants a real DTO cannot express |
+
+### 14.11 Integration status
+
+* **T23 is a library with no caller**: `main.py` is byte-for-byte unchanged, no
+  orchestrator exists, `RunContext` remains deferred (F2), and T24+ is untouched.
+* T23 consumes already-produced evidence only: it performs no Git/Sonar/Codex/
+  network/filesystem mutation of any kind, and the integration test proves a real
+  clone is unchanged after a report is built from it.
+* T22 and T23 remain independent report layers: neither imports the other, and
+  T22's behaviour is untouched.
+
+### 14.12 Acceptance criteria
+
+1. **Given** a completed T19/T20/T21 lifecycle for one issue, **when**
+   `build_per_issue_report` is called, **then** it returns an immutable,
+   deterministic, JSON-serializable, secret-free `PerIssueReport` and executes
+   nothing.
+2. **Given** `FIXED` + `COMMITTED` + `PUSHED`, **then** the outcome is `SUCCESS`;
+   **given** `COMMIT_UNVERIFIED`, `PUSH_UNVERIFIED`, an unknown status, missing
+   required evidence or contradictory evidence anywhere, **then** the outcome is
+   never `SUCCESS`.
+3. **Given** a missing T20 or T21 result for a `FIXED` issue, **then** the outcome
+   is `NOT_COMPLETED` and the stage is reported as not executed (never an assumed
+   commit or push, and never `SUCCESS`).
+4. **Given** malformed, contradictory or unknown evidence, **then** `is_valid` is
+   `False`, the outcome is `REVIEW_REQUIRED`, no per-stage status is published, the
+   failed gate is named in `validation_errors`, and the state machine's
+   `failed_phase` records where it stopped.
+5. **Given** a report that violates its own derivation invariants, **then**
+   `verify_per_issue_report` reports it and the report is never returned as valid.
+
