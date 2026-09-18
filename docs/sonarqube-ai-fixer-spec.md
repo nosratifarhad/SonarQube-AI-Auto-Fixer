@@ -4101,3 +4101,619 @@ the focused run (`pytest tests/test_sonar_rule_allowlist.py
 10. **Given** the default configuration (an empty allowlist), **then** every
     rule is denied.
 
+
+## 21. T29 - bounded logging policy (implemented policy layer, not wired)
+
+Status: **implemented** (`logging_policy.py`, version `t29.1`) - standalone -
+pure - deterministic - immutable - fail-closed - secret-safe - **unwired**
+(`main.py` and T01-T28 unchanged).
+
+### 21.1 Purpose, scope and non-goals
+
+T29 answers exactly one question:
+
+    "may this log record be emitted, and if so, in exactly what safe form?"
+
+It is a **policy layer only**. It writes nothing - no file, no stream, no standard
+output and no `logging` record - it calls nothing, it orchestrates nothing, and it
+touches no network, no Git, no SonarQube, no Codex and no file. Its whole output
+is one immutable verdict per record, and that verdict is the *only* thing T29
+publishes.
+
+**In scope:** the record grammar (§21.3); the configuration contract (§21.4);
+validation and refusal clauses (§21.5); the limits (§21.6); the statuses and
+diagnostic codes (§21.7); the precedence (§21.8); the fail-closed contract - what
+a refusal publishes, which is nothing but a fixed clause and, at most, the
+record's own validated event code (§21.9); the trust boundary (§21.10);
+redaction and secret safety (§21.11); immutability, purity and determinism
+(§21.12); serialization (§21.13); the tests (§21.14); the integration boundary
+(§21.15); the acceptance criteria (§21.16).
+
+**Non-goals (explicit):**
+
+* no log sink, no handler installation, no `logging` configuration and no
+  formatting of a log line: T29 decides, the caller writes;
+* no "log everything" switch, no implicit allowlist entry and no configuration
+  that admits a record the operator did not approve; and no configuration that
+  can switch redaction, bounding, fail-closed behaviour or unknown-field
+  rejection **off** - the only configurable knobs are the two allowlists (which
+  can only name what is permitted) and the level floor (which can only drop);
+* no severity policy, no sampling, no rate limiting, no deduplication, no
+  rotation, no structured-log schema, no tracing and no metrics;
+* no secret *discovery*: T29 does not read the environment, a file, a vault or an
+  `AnalysisConfig`, so it cannot know this project's configured secret values - it
+  redacts credential-shaped text by shape and refuses credential-shaped
+  identities;
+* no Git, no commit, no push, no SonarQube call, no Codex call, no retry and no
+  orchestration;
+* no wiring into `main.py` (or any other module) in this task (§21.15).
+
+### 21.2 The one rule - every condition must hold
+
+A record may be emitted **only** when all of the following hold:
+
+    event_code in allowed_event_codes
+    and every field name in allowed_field_names
+    and LEVEL_ORDER[level] >= LEVEL_ORDER[minimum_level]
+    and every part is printable ASCII (or a permitted scalar) within its bound
+    and no part published verbatim is credential-shaped
+
+Anything else is refused, and a refused record publishes no message and no field at
+all: not its text, not a field name, not a field value, not a length of a text, no
+hash and no partial value. Two statuses can emit - `ACCEPTED` and `REDACTED` -
+`EMITTABLE_STATUSES` is exactly that pair, and `can_emit` is *derived* from
+`decision`, which is derived from `status`, so no construction, no serialization
+and no caller can turn a refusal into an emission. A refusal is therefore a drop
+with a fixed diagnostic: the only caller string it can repeat is the record's own
+event code, and only when that code has already proved to be a well-formed,
+bounded, credential-free *identity* (§21.9).
+
+The implementation makes that structural rather than conventional: the validated
+allowlists are turned into `frozenset`s and the only approval tests in the module
+are membership of those sets, so a code or a field name that is merely *similar*
+to an entry - a prefix, a suffix, a substring, a case variant, a qualified or
+dotted spelling - is never approved. The default configuration approves T29's own
+three verdict event codes and **no field name at all**, so the default behaviour
+publishes no caller-supplied field until an operator names the fields they want
+logged.
+
+### 21.3 The record grammar
+
+A `LogEvent` has exactly four parts, and each has one accepted shape:
+
+| Part | Accepted | Refused (`INVALID_EVENT` unless stated) |
+|------|----------|------------------------------------------|
+| `event_code` | one upper-case letter, then upper-case letters, digits and `_`, at most 64 characters | absent, non-`str`, empty, whitespace, lower case, a leading digit/`_`/punctuation, `-`, `.`, `:`, `/`, `\`, `*`, `?`, `[`, `]`, `^`, `$`, `(`, `)`, `\|`, `;`, `#`, `=`, a control character, a non-ASCII character, a `str` subclass |
+| `level` | a `LogLevel` member (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`) | absent, `"info"`, `10`, `2.5`, `True`, `bytes`, a tuple, an arbitrary object - no raw value is ever mapped onto a level |
+| `message` | non-empty printable ASCII (code points `0x20`-`0x7E`), at most 500 characters | absent, non-`str`, empty, `\n`, `\r`, `\t`, `\x00`, an ANSI escape, `\x7f`, a non-ASCII character, an over-long value (`VALUE_TOO_LARGE`) |
+| `fields` | an immutable `tuple` of at most 20 immutable `(name, value)` pairs | absent/`None`, a list, a set, a frozenset, a mapping, a string, `bytes`, a generator, any other container - none of them is ever iterated |
+| `fields[i][0]` (name) | one lower-case letter, then lower-case letters, digits and `_`, at most 64 characters, unique within the record | empty, upper case, a leading digit/`_`, `-`, ` `, `.`, `:`, `/`, `!`, a control character, a non-ASCII character, a repeat, an over-long name (`VALUE_TOO_LARGE`) |
+| `fields[i][1]` (value) | `None`, a `bool`, an `int` of magnitude at most 2 ** 53, a finite `float`, or printable ASCII `str` of at most 200 characters | every other object (`bytes`, `bytearray`, a list, a tuple, a mapping, a set, a `complex`, an enum, an arbitrary object), a non-finite `float` (`nan`, `inf`, `-inf`), a control or non-ASCII character in a text value, an out-of-range integer (`VALUE_TOO_LARGE`), an over-long text value (`VALUE_TOO_LARGE`) |
+
+Nothing is ever repaired: T29 does **not** trim, case-fold, escape, encode,
+transliterate, truncate or coerce. There is no `str()`, no `repr()`, no
+`bytes()`, no `format()` and no f-string interpolation of a caller value anywhere
+in the module, so a value that is an arbitrary object is refused without a single
+method of it ever being called. Every type check is an **exact** type check except
+for the immutable `LogLevel` enum, so a `str`, `int` or `float` subclass whose
+`__len__`, `__eq__` or `__index__` the caller overrides is refused as well: a
+subclass can change what "measuring" means, so it is not a string T29 can measure.
+
+Event codes and field names are *identities*, and case is identity: `MY_EVENT` is
+not `my_event`, and `T29_LOG_ACCEPTED` is not `t29_log_accepted`. The two
+vocabularies use opposite case on purpose, so an event code and a field name can
+never be confused for one another.
+
+### 21.4 Configuration contract
+
+```python
+LoggingPolicy(
+    allowed_event_codes=("T29_LOG_ACCEPTED", "MY_EVENT"),
+    allowed_field_names=("issue_key", "attempt"),
+    minimum_level=LogLevel.INFO,
+)
+```
+
+* `allowed_event_codes` is the set of event codes that may be logged. Only an
+  **immutable `tuple`** is accepted: `None`, a list, a set, a frozenset, a
+  mapping, a bare string, `bytes` and a generator are refused
+  (`INVALID_POLICY`), because a structure that can be mutated or reordered *after*
+  validation cannot state what may be logged, and a bare string would silently be
+  read character by character. Every entry must be a usable event code (§21.3)
+  that is **not** credential-shaped, no entry may repeat, and the tuple may hold
+  at most 100 entries. The **default** is T29's own three verdict codes
+  (`T29_LOG_ACCEPTED`, `T29_LOG_REDACTED`, `T29_LOG_REJECTED`).
+* `allowed_field_names` follows the same rules with the field-name grammar, the
+  64-character entry length and a 100-entry bound. The **default is the empty
+  tuple**, which publishes no caller-supplied field at all: that is the
+  fail-closed default, and no default entry is ever added.
+* `minimum_level` is the least severe level that may be logged, as a `LogLevel`
+  member (`DEBUG` by default, which drops nothing). A record below the floor is
+  refused (`REJECTED`). The knob can only **tighten**: raising it drops records,
+  and no value of it admits a record whose code or field is not allowlisted.
+* An entry that **repeats** is an error, not a deduplication, and an entry that
+  is credential-shaped is refused too, so a policy can never make T29 publish a
+  credential-shaped identity even through its own configuration.
+* The refusal reason names the offending entry by **index** (`allowed event code
+  entry 2`) and never echoes the entry, because a refused entry may be anything at
+  all, including a credential.
+
+### 21.5 Validation (what is refused, and in which order)
+
+The configuration is validated first: **shape**, then **size**, then every entry
+in configuration order - so an oversized tuple is reported as oversized even when
+it also contains a wildcard entry, because the bound is enforced before any entry
+is read.
+
+The record is validated next, part by part, in reading order: **event code**,
+**level**, **message**, the **fields container**, then **each field entry** in
+order. Within one part the refusal classes are applied in `PRECEDENCE` order
+(§21.8), which means:
+
+* a part must be *usable* (right type, right grammar, printable) before it is
+  measured (`INVALID_EVENT` / `INVALID_FIELD` before `VALUE_TOO_LARGE`);
+* every part must be usable and bounded before any credential shape is looked for
+  (`VALUE_TOO_LARGE` before `SECRET_DETECTED`);
+* a credential-shaped *identity* refuses before the allowlist is consulted
+  (`SECRET_DETECTED` before `REJECTED`), because an identity is never rewritten
+  and there is nothing to approve;
+* the operator's approval is consulted before any text is redacted (`REJECTED`
+  before `REDACTED`), because a record the operator did not approve is not
+  redacted - it is dropped.
+
+Two negative clauses matter as much as the positive ones. Absence is never a
+default: a `None` level, message, event code or fields container is a refusal, not
+an empty value. And nothing is ever echoed: a refusal names the offending part
+(`the event code`, `the message`, `field entry 2`) and, at most, the *category* of
+a credential shape - never the value, never its type name, never its length and
+never a partial form of it.
+
+### 21.6 Limits (explicit, constant, tested around the boundary)
+
+| Constant | Value | What it bounds |
+|----------|-------|----------------|
+| `MAX_EVENT_CODE_LENGTH` | 64 | one event code |
+| `MAX_MESSAGE_LENGTH` | 500 | one message |
+| `MAX_FIELD_NAME_LENGTH` | 64 | one field name |
+| `MAX_FIELD_VALUE_LENGTH` | 200 | one text field value |
+| `MAX_FIELDS` | 20 | field entries per record |
+| `MAX_FIELD_INTEGER` | 2 ** 53 | the magnitude of an integer value |
+| `MAX_ALLOWED_EVENT_CODES` | 100 | the allowlisted event codes |
+| `MAX_ALLOWED_FIELD_NAMES` | 100 | the allowlisted field names |
+| `REDACTION_MARKER` | `"[REDACTED]"` | the whole replacement for a credential span |
+
+Every bound is a fixed module constant that **no configuration can widen, raise or
+switch off**. A bound violation is `VALUE_TOO_LARGE`, and the offender is never
+truncated: an over-long value is refused, never silently shortened, because a
+truncated value is a different value. The two "bounded, not truncated" rules that
+follow from this are:
+
+* `MAX_FIELD_INTEGER` keeps every published integer inside the range a JSON
+  consumer round-trips exactly, so an integer is refused rather than published
+  lossily;
+* redaction can only *grow* text, so the redacted result is measured again
+  (§21.11) and refused (`VALUE_TOO_LARGE`) rather than published over-long.
+
+### 21.7 Statuses and diagnostic codes
+
+| Status | Value | Diagnostic code | Decision |
+|--------|-------|-----------------|----------|
+| `ACCEPTED` | `accepted` | `T29_LOG_ACCEPTED` | `EMIT` |
+| `REDACTED` | `redacted` | `T29_LOG_REDACTED` | `EMIT` |
+| `INVALID_POLICY` | `invalid-policy` | `T29_POLICY_INVALID` | `DROP` |
+| `INVALID_EVENT` | `invalid-event` | `T29_EVENT_INVALID` | `DROP` |
+| `INVALID_FIELD` | `invalid-field` | `T29_FIELD_INVALID` | `DROP` |
+| `VALUE_TOO_LARGE` | `value-too-large` | `T29_VALUE_TOO_LARGE` | `DROP` |
+| `SECRET_DETECTED` | `secret-detected` | `T29_SECRET_DETECTED` | `DROP` |
+| `REJECTED` | `rejected` | `T29_LOG_REJECTED` | `DROP` |
+
+Every status has exactly one diagnostic code and every code belongs to exactly one
+status, so a report can be grouped and alerted on without parsing prose. The code
+carries no caller value: it is a fixed token.
+
+### 21.8 Precedence
+
+`PRECEDENCE` is exactly:
+
+```python
+PRECEDENCE = (
+    LogStatus.INVALID_POLICY,
+    LogStatus.INVALID_EVENT,
+    LogStatus.INVALID_FIELD,
+    LogStatus.VALUE_TOO_LARGE,
+    LogStatus.SECRET_DETECTED,
+    LogStatus.REJECTED,
+    LogStatus.REDACTED,
+    LogStatus.ACCEPTED,
+)
+```
+
+The rule is one-dimensional and testable: **the record's parts are read in order
+(event code, level, message, the fields container, then each field entry), and for
+the first part that is refused the first applicable class of `PRECEDENCE` decides
+the status.** Consequences, each pinned by a conflict test:
+
+| Conflict | Reported status | Why |
+|----------|-----------------|-----|
+| malformed event code + malformed message + malformed field | `INVALID_EVENT` | the code is read first |
+| well-formed but over-long code + a malformed message | `INVALID_EVENT` | content is judged before size, so the message is still "the record" |
+| malformed message + malformed field | `INVALID_EVENT` | the record is read before its fields |
+| malformed field + an over-long message | `INVALID_FIELD` | the entry is judged before any size is measured |
+| over-long field name + a credential-shaped field name | `VALUE_TOO_LARGE` | the bound is measured before credentials are searched for |
+| credential-shaped event code that is also unapproved | `SECRET_DETECTED` | an identity is never rewritten, so it is refused before approval is consulted |
+| unapproved event code + credential-shaped text | `REJECTED` | approval precedes redaction, so nothing is redacted for a record that is dropped anyway |
+| approved record with credential-shaped text | `REDACTED` | approval precedes redaction, and redaction precedes acceptance |
+
+The last two rows are the fail-closed heart of the ordering: redaction is a
+*publishing* step, so it can only ever turn an already-approved record from
+`ACCEPTED` into `REDACTED` - it can never rescue a record that would otherwise be
+refused, and it can never turn a refusal into an emission.
+
+### 21.9 Fail closed - what a refusal publishes
+
+The verdict `LogEvaluation` is the only thing T29 produces, and for a refusal its
+two text fields are empty:
+
+| Field | Emitting verdict | Refused verdict |
+|-------|------------------|-----------------|
+| `message` | the validated, bounded, redacted message | `None` |
+| `fields` | the validated, bounded, redacted pairs | `()` |
+| `event_code` | the caller's code (well-formed and credential-free) | the caller's code **only** when the refusal was reached *after* the code was validated as a well-formed, bounded, credential-free identity; otherwise `None` |
+| `level` | the caller's `LogLevel` | the caller's `LogLevel` when it was usable, else `None` |
+| `can_emit` | `True` | `False` |
+
+So a refusal publishes **no message and no field at all**: not the message, not a
+field name, not a field value, not a length, not a hash and not a partial value -
+and it does not publish the *shape* of what was refused either, beyond a fixed
+category label when a credential shape matched an identity. The rationale trail is
+always `(reason, consequence)`, so nothing can be appended to it.
+
+One caller string is deliberately exempt, and it is the narrowest possible one:
+the record's **own event code**, once it has proved to be a usable, credential-free
+identity (`PRECEDENCE` runs `INVALID_EVENT`, `VALUE_TOO_LARGE` and
+`SECRET_DETECTED` *before* `REJECTED`, so a code reaches a refusal's `event_code`
+only when it is well-formed, within `MAX_EVENT_CODE_LENGTH` and free of every
+shape in `SECRET_PATTERNS`). That is what makes a `REJECTED` or `INVALID_FIELD`
+verdict actionable - it says *which* identity was refused - and it follows the
+convention the sibling policies already use for a validated identity (T26's
+`candidate_branch`, T28's `rule_id`). Absent, malformed, over-long and
+credential-shaped codes are never echoed, by any status; a credential-shaped code
+and a credential-shaped field name are refused with `SECRET_DETECTED` and are
+absent from the verdict entirely.
+
+`can_emit` is the only permission flag, it is derived from `decision`, and
+`decision` is derived from `status`; a status outside `EMITTABLE_STATUSES` cannot
+report permission and an emitting verdict cannot carry a refusal status. The
+invariants `status in EMITTABLE_STATUSES <=> can_emit`, `decision is EMIT <=>
+can_emit` and `was_redacted <=> status is REDACTED` hold for every verdict the
+module can produce, and the tests pin them for every status.
+
+### 21.10 Trust boundary
+
+Everything a caller hands T29 is untrusted, and the boundary is drawn explicitly:
+
+* **No coercion.** No `str()`, `repr()`, `bytes()`, `format()`, f-string
+  interpolation of a caller value, `__format__`, `__str__` or `__iter__` is ever
+  invoked on a caller value. A value of the wrong type is refused at once, so an
+  object with a hostile `__str__`, `__len__`, `__eq__` or `__hash__` is refused
+  *without a single method of it being called* - the tests prove it with an object
+  whose methods raise and a counter that must stay empty.
+* **No iteration of an unvalidated container.** A list, set, mapping, string,
+  bytes or generator offered as `fields` is refused by type, never walked; a
+  generator handed to the policy is refused without being consumed.
+* **No arbitrary serialization.** A published value is only ever `None`, a `bool`,
+  a bounded `int`, a finite `float` or bounded printable `str` - all of them
+  scalar, immutable and JSON-native. No `__dict__`, no mapping, no dataclass and no
+  caller object is ever copied into a verdict.
+* **No I/O and no global state.** T29 imports the standard library only (`re`,
+  `dataclasses`, `enum`, `types`, `typing`) and no repository module; it contains
+  no `logging`, `os`, `sys`, `io`, `subprocess`, `socket`, `random`, `time`,
+  `uuid`, `hashlib` or `json` import; it opens no file, starts no process, makes no
+  network call, reads no environment variable and does not read `sys.argv`. It
+  never calls `logging.basicConfig`, never acquires a logger, never installs a
+  handler and never writes anywhere: configuring a process's logging is the
+  caller's job, and a policy that could reconfigure it could hide what it refused.
+* **No exception swallowing.** The module contains no `try`/`except` and raises
+  exactly one exception type (`TypeError`) for the two caller errors - a wrong
+  `policy` or `event` type - because a caller error is not a record problem: made
+  through the wrong door, it must be loud rather than silently logged. Even those
+  two messages name nothing the caller wrote.
+
+### 21.11 Redaction and secret safety
+
+Text is published only after every credential-shaped span in it has been replaced
+by the single marker `[REDACTED]`:
+
+* the marker is the **whole** replacement: no prefix, no suffix, no length, no
+  hash, no truncation and no partial form of a credential is ever published, and
+  the text around a span is kept verbatim;
+* detections are collected as spans from every pattern in `SECRET_PATTERNS`,
+  sorted and merged, and the text is rebuilt once - so overlapping or adjacent
+  detections collapse into one marker and inserted text is never re-scanned;
+* a credential shape found in a part that must be published **verbatim** - the
+  event code or a field name, which are the identities the allowlist is consulted
+  for - refuses the whole record (`SECRET_DETECTED`) instead of rewriting an
+  identity: an identity that changes is not an identity;
+* a credential shape found in **text** (a message, a text field value) redacts
+  that span and emits the rest of the record (`REDACTED`);
+* redaction can only grow text, so the redacted result is measured again and a
+  value that no longer fits its bound is refused (`VALUE_TOO_LARGE`) rather than
+  published over-long;
+* diagnostics never echo the offending material: they name the part by *index*
+  and, at most, the fixed category label that matched, never the matched text.
+
+The category table is `SECRET_PATTERNS`, eight labelled patterns, in the order
+that decides which label is reported when several match:
+
+| Label | Shape |
+|-------|-------|
+| `url-userinfo` | `scheme://user[:password]@host` (the same shape `secret_scan` already treats as a credential) |
+| `credential-pair` | `password=`/`token:`/`api_key=`/`authorization:`/`cookie`/`session`/`private_key`/`client_secret`/`signing_key` followed by a value |
+| `auth-scheme` | `Bearer <token>` / `Basic <blob>` |
+| `json-web-token` | three base64url segments separated by dots |
+| `prefixed-token` | `ghp_`/`gho_`/`ghs_`/`ghu_`/`ghr_`/`github_pat_`, `sk-`, `AKIA`/`ASIA`, `xox[bpasr]-`, `AIza`, `ya29.` |
+| `long-hex-run` | 32 or more hexadecimal characters |
+| `long-base64-run` | 40 or more base64 characters, optionally padded |
+| `private-key-marker` | a `-----BEGIN ... PRIVATE KEY-----` / `-----END ...` banner |
+
+Three properties of the table are deliberate and tested:
+
+* **it is over-inclusive.** A 40-character commit SHA, a UUID-looking hex run or a
+  long identifier is redacted too, because the policy cannot tell a credential
+  from an identifier by shape alone. Publishing a false positive costs a marker in
+  a log line; publishing a false negative costs a credential.
+* **the caps are above the policy's own text bounds.** Every run cap is 4096, far
+  above `MAX_MESSAGE_LENGTH` (500) and `MAX_FIELD_VALUE_LENGTH` (200), so a
+  credential that fills an entire publishable text is matched *in full*. A cap that
+  stopped short of a text's own bound would leave the tail of a long credential
+  unredacted, which is the one failure mode the table exists to prevent.
+* **no pattern requires zero characters, and every quantifier is bounded except
+  the two whitespace runs of `credential-pair`**, so a match is linear work on an
+  in-memory string - no nested quantifier, no backreference, no catastrophic
+  backtracking and no zero-length span that could make redaction loop. The
+  exception is deliberate: a keyword separated from its `=`/`:` by whitespace must
+  still be redacted, and inside the text this policy validates that run is bounded
+  by the text's own bound anyway - the only whitespace printable ASCII allows is
+  the space character, and a message is at most 500 characters and a text field
+  value at most 200. A test pins the exception and its reason.
+
+The two public helpers expose exactly the redaction the policy performs, and
+nothing else: `sanitize_log_value(text)` returns `(safe_text, redacted)` and
+`sanitize_log_fields(fields)` returns a new tuple with every text value redacted
+and every scalar passed through unchanged. Neither helper enforces a bound or a
+grammar: it is not a validator, and the policy is what validates *before* it
+redacts - a caller that holds untrusted input calls `evaluate_log_event`, not a
+helper. A non-string through `sanitize_log_value` and a malformed entry through
+`sanitize_log_fields` are `TypeError`s (caller errors), and their messages name the
+offending entry by index only.
+
+### 21.12 Immutability, purity and determinism
+
+* The three records are frozen dataclasses: assignment and deletion raise
+  `FrozenInstanceError`, their fields are reachable but not rebindable, and the
+  configuration holds only tuples and enum members.
+* Module-level tables are immutable: `EMITTABLE_STATUSES`, `PRECEDENCE`,
+  `DEFAULT_ALLOWED_EVENT_CODES`, `DEFAULT_ALLOWED_FIELD_NAMES` and
+  `SECRET_PATTERNS` are tuples (or tuples of pairs), and `DIAGNOSTIC_CODES`,
+  `LEVEL_ORDER`, `_STATUS_REASONS` and `_STATUS_CONSEQUENCES` are
+  `MappingProxyType`s that raise `TypeError` on assignment.
+* `evaluate_log_event` is pure: it reads only its two arguments, writes nothing,
+  remembers nothing, counts nothing and performs no filesystem, network,
+  subprocess, Git or logging call. The same pair always produces an equal verdict,
+  the caller's records are never mutated (not even a mutable list offered as
+  `fields`), and the module's own namespace is unchanged after any number of
+  evaluations.
+* `as_dict()` returns fresh containers on every call, so mutating a published copy
+  cannot change the verdict it came from, and a caller that mutates its own input
+  afterwards cannot change what a verdict carries - published fields are immutable
+  pairs.
+* Every decision is deterministic: no clock, no random source, no hash iteration
+  order, no locale, no environment and no `set` ordering reaches a published value.
+  The pattern table order decides the reported category, and spans are sorted
+  independently of the order in which patterns matched.
+
+### 21.13 Serialization
+
+`LogEvaluation.as_dict()` is deterministic, JSON-native and secret-free:
+
+```json
+{
+  "policy_version": "t29.1",
+  "status": "redacted",
+  "decision": "emit",
+  "can_emit": true,
+  "was_redacted": true,
+  "event_code": "T29_LOG_REDACTED",
+  "level": "warning",
+  "diagnostic_code": "T29_LOG_REDACTED",
+  "reason": "Emitted (redacted) for event 'T29_LOG_REDACTED': the record is approved, but credential-shaped text was found ...",
+  "reasons": ["<the same sentence>", "Consequence: the record is emitted with the redaction marker standing in for every credential-shaped span, and no prefix, length, hash or partial form of a credential is published."],
+  "message": "calling [REDACTED] now",
+  "fields": [["issue_key", "ACV2-642"], ["attempt", 3]],
+  "policy": {
+    "policy_version": "t29.1",
+    "allowed_event_codes": ["T29_LOG_ACCEPTED", "T29_LOG_REDACTED", "T29_LOG_REJECTED"],
+    "allowed_event_code_count": 3,
+    "allowed_field_names": ["issue_key", "attempt"],
+    "allowed_field_name_count": 2,
+    "minimum_level": "debug",
+    "maximum_supported_event_codes": 100,
+    "maximum_supported_field_names": 100,
+    "is_valid": true,
+    "refusal_reason": null
+  }
+}
+```
+
+* `LogEvaluation.message` and `LogEvaluation.fields` hold *only* values that
+  passed the whole policy: `null` and `[]` for a refusal, the redacted text for an
+  emitted record, and `fields` as ordered `[name, value]` pairs (names are unique
+  by validation, so the list is unambiguous and order-preserving).
+* `LoggingPolicy.as_dict()` publishes the validated entries in configuration order
+  (`null` plus a refusal reason when the configuration is unusable, so no malformed
+  entry is echoed) together with both bounds and the level floor.
+* `LogEvent.as_dict()` publishes **no caller text other than the code itself**:
+  only the event code (and only when it is usable *and* credential-free), the level
+  when it is a member, and the *count* of field entries - never the message, a
+  field name, a field value or even the length of a text.
+* No internal implementation detail (no span, no set, no lookup structure, no
+  counter), no command, no argv, no environment value, no path and no arbitrary
+  input object appears in any of them.
+
+### 21.14 Test guarantees
+
+`tests/test_logging_policy.py` pins, at least:
+
+* the tables: the version and marker, every limit, the five levels and the total
+  level order, the eight statuses, the two decisions, `EMITTABLE_STATUSES`,
+  `PRECEDENCE` (exact order, no repeats, all statuses), the one-to-one diagnostic
+  code map, the two defaults, and the eight credential-shape labels in table order
+  (each with a positive sample whose expected label is the first match, and the
+  property that no pattern matches an empty string - plus the pattern quantifiers:
+  every one is bounded except the two documented `credential-pair` whitespace runs,
+  which a spaced credential pair is still redacted for);
+* the record grammar: every accepted form and every refused class for the event
+  code, level, message, field container, field name and field value - including
+  wildcards, regexes, paths, URLs, shell fragments, separators, case variants,
+  control characters, non-ASCII characters, `str`/`int`/`float` subclasses,
+  non-finite floats and enum values used as data;
+* absence everywhere it can occur (a `None` code, level, message or container),
+  each with its own clause and its own status, and the fact that absence is never
+  read as an empty value or a default;
+* the bounds, at max-1 / max / max+1: event-code length, message length, field
+  count, field-name length, text-value length and integer magnitude, plus the
+  "not truncated" guarantee (an over-long value is refused and nothing of it is
+  published);
+* redaction: one marker per merged span, two markers for two spans, no prefix,
+  length, hash or partial value surviving, the surrounding text preserved,
+  over-redaction thresholds pinned at 31/32 hex and 39/40 base64 characters, a run
+  that fills a whole publishable text matched in full, and the redaction-expansion
+  bound for both a message and a field value;
+* identity refusals: a credential-shaped event code and a credential-shaped field
+  name refuse the record with the fixed category label and never echo the identity,
+  and no credential material reaches a diagnostic or a serialized verdict;
+* fail closed: `status in EMITTABLE_STATUSES <=> can_emit`,
+  `decision is EMIT <=> can_emit` and `was_redacted <=> status is REDACTED` for
+  every status; a refusal publishes `message is None` and `fields == ()` across
+  seven refusal classes; only an approved record can be redacted; and the refusal
+  echo rule is pinned directly - a refusal repeats the record's own event code only
+  when that code is a usable, credential-free identity, and an absent, malformed,
+  over-long or credential-shaped code is absent from `event_code`, from the reason
+  and from the serialized verdict;
+* precedence: `PRECEDENCE` pinned to the documented order plus a conflict case per
+  adjacent pair (record before fields, content before size, entry before size, size
+  before credentials, credentials before approval, approval before redaction);
+* approval: the default policy approves only its three codes and no field, an empty
+  vocabulary approves nothing, a merely similar code is refused, the floor only
+  drops, the floor is consulted before the code and the fields, and the code is
+  consulted before the field names;
+* the configuration contract: `None` and every non-tuple container, non-string and
+  malformed entries, credential-shaped entries, duplicate entries, the entry bound
+  and the entry length at their boundaries, an unconsumed generator, and the
+  documented check order (size before entries);
+* immutability and determinism: frozen assignment and deletion of all three
+  records, read-only module tables, an unchanged module namespace, an unmutated
+  caller (including a mutable list and an unconsumed generator), equal verdicts for
+  equal inputs, and a mutated published copy that cannot change a verdict;
+* serialization: the exact key set and values of all three `as_dict()`s, a JSON
+  round trip for emitted records (including `None`, a maximal integer, a float and
+  a bool), and the fact that `LogEvent.as_dict()` publishes no caller text other
+  than the code itself;
+* adversarial input: a million-character message is refused quickly, pathological
+  repetition does not backtrack, and objects whose `__len__`, `__eq__`, `__hash__`,
+  `__str__`, `__repr__` or `__format__` raise are refused **without any of them
+  being called** (the counter stays empty), as are hostile configuration and field
+  containers;
+* the module surface: standard-library-only imports, no repository import, no
+  forbidden module, no dangerous call, no logger and no string-inspection method,
+  `re` used only for `compile`, no `try`/`except`, only `TypeError` raised, every
+  import at module level, the exact public surface, and the documented contract in
+  the module docstring;
+* that T29 is **not wired**: no other module imports `logging_policy` or mentions
+  any of its names, and `main.py` mentions neither the task nor the policy.
+
+Result on the implementation this section describes: **428 statements, 220
+branches, 0 missed, 0 partial** (`pytest --cov=logging_policy --cov-branch`), 433
+tests. The full suite passes with the T29 tests included.
+
+### 21.15 Integration status - and `main.py` remains unwired
+
+* **T29 is a library with no caller.** `main.py` and T01-T28 are untouched; no
+  production path imports `logging_policy`, and no existing module gained a
+  dependency on it. Tests pin the absence of such an import **and** the absence of
+  the names `logging_policy`, `LoggingPolicy`, `LogEvent`, `LogEvaluation`,
+  `evaluate_log_event`, `sanitize_log_value` and `sanitize_log_fields` in every
+  other production module.
+* T29 executes nothing: no Git, no subprocess, no network, no SonarQube call, no
+  Codex call, no file access, no logger and no orchestration. It is a decision
+  function and nothing else.
+* A future integration (a later task - **not** T29) would be the point where the
+  pipeline's own logging is replaced by a call to this policy: an operation that
+  wants to log would build a `LogEvent` from what it actually knows (its stage's
+  event code, the level, a fixed message and a few structured field values), call
+  `evaluate_log_event` with the operator's configured `LoggingPolicy`, and act on
+  the verdict - emit the returned `message` and `fields` when `can_emit` is `True`,
+  and drop the record when it is `False`. Because the verdict carries the *bound,
+  sanitized* text, the emitting caller never touches an unvalidated value:
+  `message` and `fields` are the only things it may publish, and they are already
+  redacted and bounded. That wiring is deliberately **not** part of T29: the policy
+  must be independently testable first, and no orchestration is created
+  prematurely. In particular, T29 does not replace `secret_scan` (which prevents a
+  *commit* from carrying a configured secret) and does not replace the existing
+  credential redaction in `repository.py` (which rewrites external tool output); it
+  is the contract a *log record* would have to satisfy.
+* Until that integration exists, T29 is documentation plus a tested contract: it
+  cannot change what the pipeline does, and the pipeline cannot change what T29
+  answers.
+
+### 21.16 Acceptance criteria
+
+1. **Given** an allowlisted event code, an allowlisted field name and a level at or
+   above the floor, **then** the verdict is `ACCEPTED` with `decision == EMIT` and
+   `can_emit == True`, and the verdict carries the validated message and pairs.
+2. **Given** credential-shaped text in a message or in a text field value of an
+   approved record, **then** the verdict is `REDACTED`, `can_emit == True`, every
+   credential span is exactly `[REDACTED]`, and no prefix, length, hash or partial
+   form of it appears anywhere in the verdict.
+3. **Given** an event code, a field name or a level the operator did not approve,
+   **then** the verdict is `REJECTED` with `can_emit == False`, `message is None`
+   and `fields == ()`; no message, field name, field value or length is published,
+   and the only caller string the verdict may repeat is the record's own event code
+   - and only because it was already validated as a usable, credential-free
+   identity (§21.9). A credential-shaped code, a malformed code and an over-long
+   code are never named by the refusal that refuses them.
+4. **Given** a `not allowlisted` record that also carries credential-shaped text,
+   **then** the verdict is `REJECTED` and nothing is redacted: approval precedes
+   redaction, so a dropped record is not sanitized, it is dropped.
+5. **Given** a wildcard-like, regex-like, path-like, URL-like, shell-like,
+   padded, whitespace-containing, lower-case, control-character, non-ASCII or
+   over-long event code, **then** it is refused (`INVALID_EVENT`, or
+   `VALUE_TOO_LARGE` when it is merely too long) with `can_emit == False`.
+6. **Given** a non-string message, event code or a non-`LogLevel` level
+   (`None`, `True`, an integer, a float, `bytes`, a container, an arbitrary
+   object), **then** the verdict is `INVALID_EVENT`, nothing is coerced, and
+   `can_emit == False`.
+7. **Given** fields that are not an immutable tuple of immutable `(name, value)`
+   pairs of permitted scalars, **then** the verdict is `INVALID_EVENT` (bad
+   container) or `INVALID_FIELD` (bad entry), the offending entry is named by
+   index, and `can_emit == False`.
+8. **Given** a credential-shaped event code or field name, **then** the verdict is
+   `SECRET_DETECTED`, the identity is never echoed, and `can_emit == False`.
+9. **Given** an unusable configuration (`None`, a non-tuple, a malformed entry, a
+   credential-shaped entry, a duplicate entry, an oversized tuple, a
+   non-`LogLevel` floor), **then** the verdict is `INVALID_POLICY`, no record is
+   judged at all - not even a perfectly allowlisted one - and `can_emit == False`.
+10. **Given** any input, **then** only `ACCEPTED` and `REDACTED` report
+    `can_emit == True`; every other status reports `False`.
+11. **Given** two problems in one record, **then** the verdict is the first class
+    of `PRECEDENCE` for the first part that is refused (§21.8) - the order is exact
+    and documented.
+12. **Given** identical inputs, **then** the verdict is equal, `as_dict()` is
+    identical, the caller's records are unchanged and no module state changed.
+13. **Given** any input, **then** no I/O, no Git, no network, no logger, no command
+    and no mutation occurs; no caller-authored value other than a *validated* part
+    appears anywhere in the verdict; and no configuration can widen a bound or
+    switch redaction, fail-closed behaviour or unknown-field rejection off.
+14. **Given** the default configuration, **then** only T29's own three verdict
+    event codes may be logged and **no** caller-supplied field may be published.
+
