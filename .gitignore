@@ -13,3 +13,6 @@ __pycache__/
 .coverage
 htmlcov/
 coverage.xml
+
+# Default temporary clone directory used by the pipeline.
+.auto-fixer-work/

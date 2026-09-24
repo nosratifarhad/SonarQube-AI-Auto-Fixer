@@ -1,18 +1,30 @@
-# SonarQube AI Auto-Fixer — Domain & Behaviour Specification (T04–T28)
+# SonarQube AI Auto-Fixer — Domain & Behaviour Specification (T04–T30)
 
-Status: **POC implementation complete (T01–T28)** · T20 (safe, fail-closed,
+Status: **POC implementation complete (T01–T30)** · T20 (safe, fail-closed,
 exactly-one-commit Git commit), T21 (safe, fail-closed, exactly-one-push Git
 push of a T20 `COMMITTED` result), T22/T23 (the overall and per-issue reports),
 T24/T25 (the max-issue / max-iteration policy limits), T26 (the standalone
 main/default branch-protection policy, §18), T27 (the standalone fail-closed
-uncertainty policy, §19) and T28 (the standalone exact-match Sonar rule
-allowlist, §20) are implemented; none of them is
-wired into `main.py`, and T29+ is deliberately not implemented · No
+uncertainty policy, §19), T28 (the standalone exact-match Sonar rule
+allowlist, §20) and T29 (the standalone bounded logging policy, §21) are
+implemented. **T30 (§22) wires them together**: the `pipeline/` package is the
+orchestration layer, and `main.py --run` invokes it. The T20 commit and T21
+push remain opt-in (`--commit` / `--push`) and every irreversible step is still
+gated by T26/T27 · No
 real SonarQube credentials and no real push are ever made by this tool (every
 T21 push targets a bare repository under `tmp_path`) · Tests never invoke a real
 Codex CLI, never need a real project toolchain, never need a live SonarQube
 server, and never touch the real repository (every T20/T21 test uses a real
-repository under `tmp_path`).
+repository under `tmp_path`). The T30 tests inject every I/O boundary, so the
+whole pipeline is exercised without Git, SonarQube, Codex or a toolchain.
+
+> **Reading the "unwired" statements in §12–§21.** They describe the library
+> modules *in isolation*, and they remain true as a layering guarantee: no
+> root-level library module imports another one, and `main.py` never imports a
+> policy or mutation module directly. Since T30 (§22) the `pipeline/` package is
+> the **only** consumer that composes them; where an older section says "no
+> caller", read it as "no caller inside the library and none from `main.py`".
+> The composition, and the mutation gates it drives, are documented in §22.
 
 ## 1. Purpose
 
@@ -83,9 +95,11 @@ source code is modified by these stages.
 | — | Pre-T20 safety primitive: secret scan of a future commit's content | `secret_scan.py` | ✔ (primitive only, no commit) |
 | T20 | Safe, fail-closed, exactly-one-commit Git commit of a verified fix | `commit_message.py`, `commit_policy.py`, `git_commit.py` | ✔ |
 | T21 | Safe, fail-closed, exactly-one-push Git push of a T20 `COMMITTED` result | `push_policy.py`, `git_push.py` | ✔ |
-| T22–T27 | Reporting (§13–§14), the two policy limits (§15–§16), branch protection (§18) and the uncertainty policy (§19) | `overall_report.py`, `per_issue_report.py`, `issue_limit.py`, `iteration_limit.py`, `branch_protection.py`, `uncertainty_policy.py` | ✔ (none wired) |
-| T28 | Sonar rule allowlist policy (exact match, fail-closed, §20) | `sonar_rule_allowlist.py` | ✔ (standalone, not wired) |
-| T29+ | PRs, retry loops, orchestration, CI, containers | — | ✖ not implemented |
+| T22–T27 | Reporting (§13–§14), the two policy limits (§15–§16), branch protection (§18) and the uncertainty policy (§19) | `overall_report.py`, `per_issue_report.py`, `issue_limit.py`, `iteration_limit.py`, `branch_protection.py`, `uncertainty_policy.py` | ✔ (wired by T30) |
+| T28 | Sonar rule allowlist policy (exact match, fail-closed, §20) | `sonar_rule_allowlist.py` | ✔ (wired by T30) |
+| T29 | Bounded logging policy (§21) | `logging_policy.py` | ✔ (wired by T30) |
+| T30 | End-to-end orchestration: configuration, policy-bound logging, lifecycle wiring, commit/push opt-in | `pipeline/` | ✔ |
+| T31+ | PRs, retry loops, CI, containers | — | ✖ not implemented |
 
 ## 3. Actors and system context
 
@@ -1265,20 +1279,23 @@ Pre-T20 safety primitives
 | `tests/test_t20_t21_integration.py` | T21.1.c real T20→T21 handoff: a genuine `GitCommitExecutor` commit in a `tmp_path` clone feeds a genuine `GitPushExecutor.push_safely` both as the `CommitResult` object and as its `as_dict()` view (exactly one push, local bare remote read back at `T20.new_head`, local state unchanged), plus the pinned `CommitResult.as_dict()` → `_project_t20` → `PushFacts` key contract |
 | `tests/test_overall_report.py` | T22 (§13): pure aggregation of T19/T20/T21 evidence, every source status and count, the end-to-end/partial/failed/review classifications, every fail-closed gate (G1-G20), determinism, ordering, secret safety, immutability, the S0-S11 state machine, canonical serialization, and a genuine `GitCommitExecutor`/`GitPushExecutor` handoff in a `tmp_path` clone whose repository is provably untouched by the report |
 | `tests/test_overall_report_policy.py` | T22 (§13): gate catalogue/`GATE_PHASE` integrity, policy defaults and derived evidence requirements, the collection/identity/value/payload helpers, the fail-closed failure-report contract, and the module's freedom from any execution dependency |
+| `tests/test_pipeline_config.py` | T30 (§22): configuration required/malformed values, command parsing, limit defaults, token secret-safety, work-dir override |
+| `tests/test_pipeline_run.py` | T30 (§22): T24/T25/T26/T28 blocks, the FIXED happy path, Codex/test/scope failures, unavailable SonarQube, commit/push wiring, repository failure as a blocked attempt, blocked issues excluded from the overall report, and the T23 outcome for a FIXED-but-not-committed issue |
+| `tests/pipeline_fakes.py` | T30 (§22): non-collected fakes for every injected I/O boundary |
 
 Run: `.venv\Scripts\python -m pytest -q --cov=. --cov-report=term-missing`
 
-## 10. Non-goals (unchanged for T22+)
+## 10. Non-goals (unchanged for T22+, now that T30 wires the stages)
 
-* No PR creation (T27+), no reporting beyond the T22 structured overall report
-  (§13) and the T23 per-issue report (§14), no retry or iteration **loops** and
-  no orchestration. The T24/T25 limits (§15, §16) exist as pure policy modules
-  only: they bound a run's issue selection and one issue's retry counter, but
-  nothing calls them and nothing loops. T26 (§18) exists as a pure policy module
-  too: it decides whether a branch is safe to mutate, but it runs no Git
-  command, discovers no default branch, creates no branch and is called by
-  nothing. No branch/rule *enforcement* (T27+) and no production logging,
-  container, or GitLab CI wiring (T29+).
+* No PR creation, no reporting beyond the T22 structured overall report (§13)
+  and the T23 per-issue report (§14), and no retry or iteration **loops**. T30
+  (§22) now orchestrates the existing stages, but it adds no PR, no retry loop
+  and no CI/container wiring. The T24/T25 limits (§15, §16) bound a run's issue
+  selection and one issue's retry counter; T30 calls them but never loops. T26
+  (§18) decides whether a branch is safe to mutate; T30 passes its verdict to the
+  mutation gates, but T26 itself still runs no Git command, discovers no default
+  branch and creates no branch. No production logging beyond the T29-bound
+  pipeline logger, no container and no GitLab CI wiring.
 * T20 performs exactly two Git writes and T21 exactly one (see §11, §12), and
   nothing else: they never push more than once, fetch, pull, clone, reset,
   restore, clean, stash, check out, switch, amend, retry, or write
@@ -1305,12 +1322,12 @@ Run: `.venv\Scripts\python -m pytest -q --cov=. --cov-report=term-missing`
 * T14 does not install dependencies, build the project, or run anything other
   than the single configured test command, and T15 never acts on an outcome
   (no retry, no Codex re-invocation, no branching logic).
-* `main.py` deliberately remains unwired: T05–T22 are validated as units with
-  injectable boundaries, and full pipeline orchestration (including how the
-  scanner command, test command, branch names and push remote are configured for
-  a real project) is not part of this scope. T21 in particular is **not** called
-  by any production path yet: nothing pushes automatically, and T22 is a library
-  with no caller either (it consumes results, it never produces them).
+* `main.py` keeps its original read-only T01–T04 behaviour by default and adds
+  `--run` (T30 orchestration), `--commit`, `--push` and `--json`. The library
+  stages remain validated as units with injectable boundaries; the `pipeline/`
+  package is the composition layer. T21 is **not** called unless `--push` is
+  passed *and* a real T20 commit reports `is_committed`, so nothing pushes
+  automatically.
 
 ## 11. T20 — safe, fail-closed, exactly-one-commit Git commit (implemented)
 
@@ -4717,3 +4734,155 @@ tests. The full suite passes with the T29 tests included.
 14. **Given** the default configuration, **then** only T29's own three verdict
     event codes may be logged and **no** caller-supplied field may be published.
 
+## 22. T30 — end-to-end orchestration (implemented)
+
+Status: **implemented** (`pipeline/config.py`, `pipeline/logging.py`,
+`pipeline/run.py`, version `t30.1`) · the first and only composition layer ·
+fail-closed · every I/O boundary injectable · invoked by `main.py --run`.
+
+### 22.1 Purpose, scope and non-goals
+
+T30 wires the existing stages (T01–T29) into one run, in the documented order:
+
+```
+SonarQube -> issue selection -> clone/branch -> issue context
+    -> Codex prompt -> Codex execution -> result analysis
+    -> working-tree diff -> change scope -> project tests
+    -> analysis trigger -> analysis wait -> issue verification
+    -> final status -> (branch/uncertainty policy) -> commit -> push
+    -> per-issue report -> overall report
+```
+
+* **In scope**: configuration loading; per-issue lifecycle execution; the T24
+  selection bound; the T25 attempt bound; the T26/T27/T28 gates; the T20/T21
+  irreversible steps (opt-in); T22/T23 reporting; T29-bound logging.
+* **Non-goals**: no retry/iteration loop (T25 decides whether one attempt may
+  run; the pipeline runs exactly one), no PR creation, no CI/container wiring,
+  no re-implementation of any policy (every decision stays in its module).
+
+### 22.2 The orchestration package
+
+| Module | Role |
+|--------|------|
+| `pipeline/config.py` | `PipelineConfig` + fail-closed `load_pipeline_config` |
+| `pipeline/logging.py` | `PolicyLogger` and the default `LoggingPolicy` (T29) |
+| `pipeline/run.py` | `FixPipeline`, `PipelineDependencies`, the run DTOs |
+
+The package lives under `pipeline/` deliberately: the top-level modules are the
+pure, dependency-free library, and T30 is the composition boundary that is
+allowed to depend on several of them. The root-level "not wired" guarantees
+(§19.15, §20.15, §21.15) remain true of the library modules; T30 is their
+first consumer.
+
+### 22.3 Configuration (fail closed)
+
+`load_pipeline_config(env)` reads `FIXER_*` values (plus `SONAR_URL` /
+`SONAR_TOKEN` / `PROJECT_KEY`). Required: repository URL, source branch, work
+directory, test command, analysis command, Sonar URL and project key. The T24
+`max_issue_limit` and T25 `max_iterations` bounds are optional at load time but
+their absence is refused by the owning policy at run time (an unconfigured
+limit is **not** read as "unlimited"). A missing or malformed value raises
+`PipelineConfigError` naming the variable. Commands accept a JSON array or a
+whitespace-separated string and must name an executable first. Numeric values
+are integers or **finite** numbers: `nan`, `inf` and `-inf` are refused because
+a non-finite timeout would silently disable the bound it exists to enforce.
+`PipelineConfig.as_dict()` never contains the token and credential-redacts the
+repository URL, and `.env.example` documents every variable with placeholders
+only (no secret, and the irreversible steps default to `false`).
+
+### 22.4 Per-issue lifecycle and gates
+
+For each accepted issue, in order:
+
+1. **T28** rule allowlist - a rule that is not exactly allowlisted is blocked
+   before any repository work.
+2. **T25** iteration limit - a disallowed attempt is blocked.
+3. The agent branch is derived (T07 naming) and **T26** decides whether it may
+   be mutated (the default branch is supplied by configuration; `None` refuses).
+4. **T05/T06/T07** clone, check out the source branch, create the agent branch.
+5. **T08** verified issue context; the **clean baseline is captured before
+   Codex** with `include_ignored=True`.
+6. **T09/T10/T11** prompt, execution, interpretation.
+7. **T12/T13** diff + change scope.
+8. **T14/T15** project tests.
+9. **T16/T17** analysis trigger + wait (the scanner environment carries the
+   Sonar credentials; the client is used only for the CE-task read).
+10. **T18** issue verification with the T17 completion (correlation requires the
+    declared single-analysis precondition).
+11. **T19** final classification (the T16 trigger is carried in).
+12. post-run snapshot + attribution;
+13. when `FIXED` and `commit_fixes` is enabled: **T27 `PRE_COMMIT`** → **T20**
+    commit; when committed and `push_fixes` is enabled: **T27 `PRE_PUSH`** →
+    **T21** push;
+14. **T23** per-issue report; the run ends with the **T22** overall report.
+
+Defaults are `commit_fixes=False` and `push_fixes=False`, so the pipeline is
+read-only unless an operator opts in. `push_fixes` is only ever attempted for a
+commit whose result reports `is_committed`.
+
+### 22.5 Failure handling
+
+* A stage error (a `RepositoryError`, `ContextError`, `GitDiffError`,
+  `ChangeScopeError`, `TestRunnerError`, `CodexExecutorError`,
+  `SonarAnalysisError`, `AnalysisWaitError`, `GitCommitError`, `GitPushError`,
+  `WorktreeBaselineError`, …) is caught and recorded as a **blocked attempt**
+  with the exception *type* and message; it never crashes the run.
+* An unexpected exception is handled the same way (fail closed), never turned
+  into a success.
+* The stored `blocked_reason` and the `diagnostics` are redacted first: the
+  configured literal token is replaced, then T29's credential-shape redaction is
+  applied. `diagnostics` additionally preserves the (redacted) traceback so a
+  blocked attempt stays debuggable, but it is **excluded from `as_dict()`** - a
+  report, a log or a `--json` dump never publishes a traceback.
+* A blocked issue contributes **no** lifecycle entry to the T22 report, so the
+  aggregate is never inflated by an attempt that did not happen.
+* A refusal from T24/T25/T26/T27/T28 produces a typed result with a decisive
+  reason; it is never a silent skip.
+
+### 22.6 Logging (T29)
+
+`PolicyLogger.emit(event_code, message, level, fields)` builds a
+`logging_policy.LogEvent`, evaluates it and only publishes the **validated,
+bounded, redacted** message and fields to a sink. The default policy approves
+the pipeline's own event codes and six structured field names; anything else is
+dropped. The decided records (emitted *and* dropped) are attached to the run
+result for audit, and no credential can reach a sink.
+
+### 22.7 Public surface
+
+`PipelineConfig`, `load_pipeline_config`, `PipelineConfigError`, `FixPipeline`,
+`PipelineDependencies`, `build_default_dependencies`, `IssueRunResult`,
+`PipelineRunResult`, `PolicyLogger`, `build_default_logging_policy`.
+
+### 22.8 Tests
+
+| Test file | Covers |
+|-----------|--------|
+| `tests/test_pipeline_config.py` | required/malformed values, JSON and string command parsing, limit defaults, non-finite numeric refusal, the token never being published while driving secret scanning, repository-URL redaction, the work-dir override, and the `.env.example` contract (every variable documented, no secret, irreversible steps off) |
+| `tests/test_pipeline_run.py` | T24 refusal, T28/T25/T26 blocks, the FIXED happy path, Codex failure, test failure, scope violation, unavailable SonarQube, commit/push wiring and the "no push without a commit" rule, repository failure as a blocked attempt, redacted diagnostics that are preserved in-process but excluded from every serialized view, blocked issues excluded from the overall report, and no token in the serialized result |
+| `tests/pipeline_fakes.py` | non-collected fakes for every injected boundary |
+
+### 22.9 Integration status
+
+* `main.py` keeps its original read-only T01–T04 behaviour with no arguments and
+  adds `--run`, `--commit`, `--push` and `--json`. The Windows-style default path
+  is byte-for-byte behaviourally unchanged.
+* The library modules at the repository root remain free of any dependency on
+  T30; the pipeline depends on them, never the reverse.
+* Nothing is pushed automatically: T21 runs only with `--push` and only for a
+  commit T20 proved.
+
+### 22.10 Acceptance criteria
+
+1. **Given** a configured run and successful stages for one issue, **when**
+   `FixPipeline.run` is called, **then** the issue is classified `FIXED`, a
+   per-issue report and an overall report are produced, and nothing is written
+   unless `commit_fixes`/`push_fixes` are enabled and approved.
+2. **Given** any stage error or policy refusal, **then** the attempt is recorded
+   as blocked with a reason, the run continues, and no success is inferred.
+3. **Given** a non-allowlisted rule, a refused iteration, or an unsafe/default
+   branch, **then** no repository work happens for that issue.
+4. **Given** `push_fixes` enabled but a commit that is not `is_committed`,
+   **then** no push is attempted.
+5. **Given** the token, **then** it is never present in any log, report or
+   serialized result.
