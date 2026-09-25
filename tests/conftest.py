@@ -78,6 +78,12 @@ def make_remote_repo(tmp_path: Path):
         seed.mkdir()
         write_default_files(seed)
         git_run(seed, "init", "-b", "main")
+        # Hermetic identity: set it on the repository itself so the fixture
+        # never depends on an ambient global/system Git identity. GitHub-hosted
+        # runners have none, and committing there fails with
+        # "fatal: empty ident name ... not allowed".
+        git_run(seed, "config", "user.name", "Test User")
+        git_run(seed, "config", "user.email", "test@example.com")
         git_run(seed, *_GIT_IDENTITY, "commit", "--allow-empty", "-m",
                "chore: empty history root")
         git_run(seed, "add", ".")
