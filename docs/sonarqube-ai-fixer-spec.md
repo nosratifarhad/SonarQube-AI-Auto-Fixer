@@ -1329,6 +1329,11 @@ Run: `.venv\Scripts\python -m pytest -q --cov=. --cov-report=term-missing`
   passed *and* a real T20 commit reports `is_committed`, so nothing pushes
   automatically.
 
+> **Future direction (not implemented):** configurable SonarQube
+> authentication, GitLab integration, and SonarQube/GitLab MCP are specified as
+> *planned, not implemented* tasks in **section 23**. They do not change any
+> non-goal above.
+
 ## 11. T20 — safe, fail-closed, exactly-one-commit Git commit (implemented)
 
 T20 turns a T19 `FIXED` attempt into **at most one** commit that contains
@@ -4886,3 +4891,468 @@ result for audit, and no credential can reach a sink.
    **then** no push is attempted.
 5. **Given** the token, **then** it is never present in any log, report or
    serialized result.
+
+## 23. Future Integrations & Authentication (planned - NOT IMPLEMENTED)
+
+> **Status: specification only.** Nothing in this section is implemented.
+> It defines *future* capabilities, the evidence behind them, and the exact
+> conditions that must be verified before any code is written. It does **not**
+> change the behaviour of T01-T30, the CLI, the scanner, the reports, or the
+> existing token-based authentication.
+
+### 23.1 How to read this section
+
+**Status markers** used throughout:
+
+| Marker | Meaning |
+|--------|---------|
+| [Current] | Implemented and active today. |
+| [Planned] | Agreed direction; **not implemented**. |
+| [Candidate] | Worth evaluating; **not implemented** and not yet agreed. |
+| [Needs verification] | Cannot be decided from the repository or public docs; an environment/operator fact is required. |
+
+**Evidence labels** used for every claim:
+
+* **Repository fact** - verified by reading this repository.
+* **Official docs** - verified against SonarSource documentation (see sources
+  in section 23.9).
+* **Needs verification** - environment-specific; must be checked against the
+  real deployment before implementation.
+* **Decision required** - a product/architecture choice for humans, not a fact.
+
+**Today vs Future at a glance**
+
+| Capability | Today | Future | Status |
+|------------|-------|--------|--------|
+| SonarQube token authentication | Supported (HTTP Basic `token:`) | Keep as default | [Current] |
+| SonarQube scanner authentication | `SONAR_HOST_URL` + `SONAR_TOKEN` env | Keep unchanged | [Current] |
+| SonarQube username/password | Not supported | Considered | [Planned] / [Needs verification] |
+| GitLab integration (any) | None (generic Git remote only) | Considered | [Planned] / [Needs verification] |
+| GitLab username/password | Not supported | Decision point | [Needs verification] |
+| SonarQube MCP | Not supported | Considered | [Planned] |
+| GitLab MCP | Not supported | Candidate | [Candidate] / [Needs verification] |
+| Configurable auth mode | Single implicit token mode | Proposed `SONAR_AUTH_MODE` | [Planned] |
+
+### 23.2 What exists today (facts)
+
+**Repository facts**
+
+* The SonarQube REST client authenticates with HTTP Basic, using the token as
+  the username and an empty password: `sonar_client.py:66`
+  (`self._session.auth = (sonar_token, "")`). Only `GET` requests are made
+  (`sonar_client.py:80`, `sonar_client.py:161`).
+* Endpoints used: `GET /api/projects/search`, `GET /api/issues/search`,
+  `GET /api/ce/task`.
+* The re-analysis scanner authenticates **separately** through the child
+  process environment: `SONAR_HOST_URL` and `SONAR_TOKEN`
+  (`sonar_analysis.py:298-300`), never through command-line arguments.
+* Configuration is loaded from `.env` (via `python-dotenv`) and the OS
+  environment, OS env taking precedence (`config.py:50-52`,
+  `pipeline/config.py:353-359`). `SONAR_TOKEN` is exposed to reports only as
+  the boolean `has_token` (`pipeline/config.py`), never as a value.
+* Git operations use the system `git` through a **generic remote** name
+  (`FIXER_REMOTE_NAME`, default `origin`); there is **no GitLab (or GitHub)
+  hosting-provider API code** anywhere in the repository.
+* There is **no MCP code, configuration, or dependency** anywhere in the
+  repository.
+
+**Official docs (SonarSource)**
+
+* The Web API should preferably be authenticated with the **bearer** scheme:
+  `Authorization: Bearer <token>`; a token may also be sent with **basic**
+  authentication. Both are valid for tokens.
+* A **User** token grants the Web API actions the user can perform in the UI.
+  Project/global analysis tokens are narrower.
+* The scanner uses the token as the `sonar.token` property or the
+  `SONAR_TOKEN` environment variable.
+* The documentation states that **using a token is preferred over a login and
+  password**.
+
+### 23.3 SonarQube username/password authentication ([Planned], NOT IMPLEMENTED)
+
+**Why considered.** Some deployments may wish to authenticate without
+distributing a long-lived token. This is a convenience/operations question, not
+a defect: token authentication already works.
+
+**Current mechanism.** Token only (section 23.2). There is no password field
+and no login call.
+
+**Proposed future configuration (proposed, not implemented).**
+
+| Variable | Purpose |
+|----------|---------|
+| `SONAR_AUTH_MODE` | `token` (default) or `password` (future). Omitted means `token`. |
+| `SONAR_USERNAME` | Username for `password` mode. |
+| `SONAR_PASSWORD` | Password for `password` mode. |
+
+**Expected authentication lifecycle (to be verified before implementation).**
+The only documented, verifiable path would be: establish a session/token once
+using a supported authentication call, then reuse it for the REST reads. The
+SonarQube documentation references endpoints named
+`/api/authentication/login`, `/api/authentication/logout` and
+`/api/authentication/validate`, but their behaviour under SSO/SAML/MFA and
+their suitability for automation are **not verified**. No endpoint or flow is
+asserted here.
+
+**Credential storage.** `.env` or OS environment only (never in source, never
+committed). `.env` is already git-ignored.
+
+**Credential protection.** Same policy as the token today: never logged, never
+placed on a command line, never serialized; added to the secret-scan list used
+by the reports; redacted from diagnostics and exceptions.
+
+**SSO/SAML/MFA impact ([Needs verification]).** If the deployment enforces SSO
+or MFA, local password login is typically unavailable, and any login flow may
+be interactive. The feature must fail closed (clear error) rather than attempt
+to bypass an identity provider.
+
+**What must be verified first ([Needs verification]).**
+
+1. Whether the deployment exposes a supported, automatable login/session
+   mechanism at all.
+2. Whether local password authentication is enabled (versus SSO-only).
+3. Whether MFA/IdP interferes.
+4. The resulting session/token lifetime and renewal behaviour.
+
+**Backward compatibility.** `token` remains the default and `SONAR_TOKEN` keeps
+working exactly as today. An omitted `SONAR_AUTH_MODE` must behave as `token`.
+Existing users change nothing.
+
+**Scanner separation (mandatory).** The scanner must **never** receive a
+password or a browser session. Scanner authentication stays token/environment
+based (`SONAR_HOST_URL` / `SONAR_TOKEN`) or its own configured mechanism. A new
+auth mode applies to the REST client only.
+
+**Failure / invalid-credential behaviour.** Invalid or expired credentials must
+produce a clear `SonarQubeError`/`ConfigurationError` and the pipeline must fail
+closed (blocked/review), never a partial success. No retry loop is introduced
+here (retry remains out of scope).
+
+**Required tests (when implemented).** Unknown mode rejection; missing
+username/password; successful login-to-session mapping (with a fake); invalid
+credentials; expired session; assertion that the password never appears in
+logs/reports/serialization; assertion that the scanner environment is
+unchanged; backward-compatibility test that omitted mode equals `token`.
+
+**Security requirements.** Same as the token path; additionally,
+password values must never be persisted outside `.env`/environment and must be
+included in redaction/secret-scanning.
+
+**Status: [Planned] - NOT IMPLEMENTED.** The project explicitly does **not**
+claim that username/password works with the target deployment.
+
+### 23.4 GitLab authentication ([Planned] / [Needs verification], NOT IMPLEMENTED)
+
+**Current state.** There is **no GitLab integration** today. The pipeline
+clones, commits and pushes through the generic `git` transport
+(`repository.py`, `git_commit.py`, `git_push.py`) to a configured remote. No
+GitLab API is called and no GitLab credential is handled.
+
+**Why considered.** Future capabilities (for example, creating a merge request
+or wiring GitLab MCP) would need the GitLab API and therefore a GitLab
+authentication method.
+
+**Is username/password appropriate? [Needs verification] / [Decision
+required].** This repository contains no evidence either way, and the target
+deployment is unknown. Common GitLab automation mechanisms (personal access
+tokens, OAuth, or SSH keys) may be preferable to a password; Git operations over
+HTTPS commonly use a token rather than a password. None of this is asserted as
+fact for the target; it must be confirmed. If username/password is not
+supported or not appropriate, the correct outcome is a documented decision, not
+a workaround.
+
+**Proposed future configuration (proposed, not implemented).** Illustrative
+only; final names and precedence depend on the verification below.
+
+| Variable | Purpose |
+|----------|---------|
+| `GITLAB_URL` | Base URL of the GitLab instance. |
+| `GITLAB_AUTH_MODE` | e.g. `pat` / `oauth` / `password` - **to be decided**. |
+| `GITLAB_TOKEN` | Token for `pat`/`oauth` modes (future). |
+| `GITLAB_USERNAME` / `GITLAB_PASSWORD` | Only if the deployment supports it (future). |
+
+**What must be verified first ([Needs verification]).**
+
+1. Which authentication methods the target GitLab version/edition supports for
+   automation.
+2. Whether username/password is supported or discouraged/disabled.
+3. Whether PAT/OAuth/application credentials are the appropriate mechanism.
+4. The exact API(s) needed for the desired future capability and their
+   authentication.
+
+**Integration boundary.** Any future GitLab integration must be a separate,
+opt-in client alongside the existing generic-Git push/commit path, which must
+remain unchanged. Git credentials must never be passed to the SonarQube scanner
+or into RunContext/reports.
+
+**Status: [Planned] / [Needs verification] - NOT IMPLEMENTED.**
+
+### 23.5 SonarQube MCP ([Planned], NOT IMPLEMENTED)
+
+**Purpose in this project.** MCP (Model Context Protocol) would let the
+**agent** (Codex) query SonarQube through tools - for example discovering issues
+or quality-gate information - rather than only through this project's own REST
+client. It is an *agent tool interface*, not a replacement for the pipeline's
+REST reads or the scanner.
+
+**Why separate from the existing REST client.** The pipeline needs
+deterministic, typed REST reads (`/api/issues/search`, `/api/ce/task`) for
+T17/T18/T19 and a deterministic scanner run for T16. MCP is interactive and
+agent-facing. They are parallel access paths and must not be conflated.
+
+**Verified facts (Official docs / official repository).**
+
+| Fact | Detail |
+|------|--------|
+| Server exists | Official `SonarSource/sonarqube-mcp-server`; OCI image `sonarsource/sonarqube-mcp`. |
+| Server version prerequisite | SonarQube Server **2025.1+** or Community Build **25.1+**; the server checks the instance version at startup and exits if too old. |
+| Token requirement | A **User** token is required; project/global tokens will not work properly. |
+| Server config | `SONARQUBE_TOKEN` + `SONARQUBE_URL` (Server); optional `SONARQUBE_PROJECT_KEY`. |
+| Transports | **Stdio** (default, local subprocess) and **Streamable HTTP** at `/mcp` (HTTP requires per-request `Authorization: Bearer <token>`). |
+| Read-only mode | `SONARQUBE_READ_ONLY=true` disables write operations. |
+| Toolsets | Selectable via `SONARQUBE_TOOLSETS` (e.g. `issues`, `projects`, `rules`, `quality-gates`, `sources`); `projects` is always enabled. |
+| Storage | `STORAGE_PATH` (absolute, writable). |
+| Codex CLI | The official README documents a Codex CLI configuration (`~/.codex/config.toml`, `[mcp_servers.sonarqube]`). |
+
+**Local OCI runtime (verified).** Docker is available and its daemon is
+reachable (`client=29.6.1 server=29.6.1`); `podman`/`nerdctl` are absent.
+
+**Coexistence with `SonarClient`.** MCP would be added as an *additional*
+integration; `SonarClient`, the scanner stage, and all T01-T30 behaviour remain
+exactly as they are. MCP must never be required for the pipeline to function.
+
+**Security / trust boundary.** MCP output is external and therefore untrusted:
+it must be treated like other external data (validated, never executed as a
+command, never trusted as sole evidence for a `FIXED` decision). The MCP server
+holds credentials and exposes tools, which is a new trust boundary.
+
+**Secret handling.** The MCP server's token must come from environment
+variables, never hardcoded or committed. Any token supplied to it must not be
+serialized into reports or diagnostics, and must be covered by the same
+redaction rules as `SONAR_TOKEN`.
+
+**Failure behaviour.** If the MCP server is unavailable or misconfigured, only
+the MCP-dependent capability is affected; the rest of the pipeline must be
+unaffected and fail closed where MCP data was required.
+
+**Testing strategy (when implemented).** Fake MCP client/server; tool-result
+validation; malformed-response handling; authentication failures;
+assertion that no MCP secret is serialized; assertion that the pipeline works
+without MCP enabled.
+
+**Operational considerations.** Requires a recent SonarQube version, a User
+token, and an OCI runtime (Docker is available locally). Stdio is the simplest,
+most local-friendly transport for the Codex CLI. Prefer `SONARQUBE_READ_ONLY=true`
+to keep the integration non-mutating.
+
+**Status: [Planned] - NOT IMPLEMENTED.**
+
+### 23.6 GitLab MCP ([Candidate], [Needs verification], NOT IMPLEMENTED)
+
+**Current state.** No GitLab MCP exists here, and its capabilities were **not**
+verified in this repository or against authoritative documentation.
+
+**Desired capability (if pursued).** Allow the agent to interact with GitLab
+(for example, read merge requests) through MCP tools, consistent with whatever
+GitLab integration is eventually chosen.
+
+**What must be verified first ([Needs verification]).**
+
+1. Whether an appropriate/official GitLab MCP server exists and is maintained.
+2. Its transport (Stdio / HTTP), runtime, and installation method.
+3. Its authentication requirements (PAT, OAuth, etc.) and token scopes.
+4. Which tools/capabilities it exposes and whether they are read-only.
+5. Its compatibility with the target GitLab version/edition.
+
+**Authentication / transport / security.** To be documented only after
+verification. Any GitLab MCP credential must follow the same secret-handling
+rules as the rest of the project and must never reach the SonarQube scanner or
+serialized reports.
+
+**Integration boundary.** Separate and opt-in; must not alter the existing
+generic-Git push/commit path or T01-T30.
+
+**Decision required before development.** Whether GitLab MCP is wanted at all,
+and if so with which server, transport, and authentication.
+
+**Status: [Candidate] / [Needs verification] - NOT IMPLEMENTED.**
+
+### 23.7 Proposed shared authentication & configuration model (NOT IMPLEMENTED)
+
+The minimum model that could support the above **without** over-engineering:
+
+* `SONAR_AUTH_MODE` (default `token`). An omitted value behaves as `token`, so
+  existing configuration is unchanged.
+* Additional modes add only their own required variables and are strictly
+  opt-in.
+* The **scanner** stays token/environment based and must never receive
+  passwords or session cookies.
+* **No authentication-provider abstraction** is introduced until a second mode
+  is actually implemented. Today there is one REST client and one mechanism;
+  an abstraction now would be speculative.
+* New secrets must be: excluded from `PipelineConfig.as_dict()`; added to the
+  `forbidden_secrets`/redaction/secret-scan sets; never placed on a command
+  line; never included in diagnostics.
+* Configuration precedence remains OS environment over `.env`.
+
+**Proposed future variables (illustrative; not implemented):**
+`SONAR_AUTH_MODE`, `SONAR_USERNAME`, `SONAR_PASSWORD`, and (for GitLab)
+`GITLAB_URL` / `GITLAB_AUTH_MODE` / `GITLAB_TOKEN` / `GITLAB_USERNAME` /
+`GITLAB_PASSWORD`. Final names are subject to the verification in sections
+23.3-23.6.
+
+### 23.8 What does NOT change
+
+* SonarQube authentication remains **token-based** by default.
+* The scanner's environment-based authentication (`SONAR_HOST_URL` /
+  `SONAR_TOKEN`) is unchanged.
+* The REST client's current behaviour and endpoints are unchanged.
+* The CLI and its safety gates (`--run`, `--commit`, `--push`, `--json`) are
+  unchanged; the default invocation stays read-only.
+* Commit/push policy and the invariant `push => commit succeeded` are unchanged.
+* Secret redaction (T29, secret scan, diagnostics) is unchanged and must not be
+  weakened.
+* CI behaviour is unchanged.
+
+### 23.9 Evidence ledger
+
+**Verified (this specification may rely on these):**
+
+* Repository facts in section 23.2.
+* Official SonarQube documentation on Web API bearer/basic token auth, token
+  types, scanner `SONAR_TOKEN`, and the "token preferred over login/password"
+  guidance.
+* Official SonarQube MCP server facts in section 23.5.
+
+**Sources consulted:** `docs.sonarsource.com` Web API and token-management
+pages, and the `SonarSource/sonarqube-mcp-server` README.
+
+**Planned (agreed direction, not implemented):** configurable SonarQube auth
+mode; SonarQube username/password; SonarQube MCP.
+
+**Needs verification (environment/operator):** the target SonarQube version;
+the token type/permissions; the SSO/SAML/MFA posture; whether username/password
+is enabled; the target GitLab version/edition and its supported automation
+authentication; whether a suitable GitLab MCP server exists.
+
+**Decision required:** whether GitLab integration and/or GitLab MCP are wanted;
+which GitLab authentication method to prefer; which MCP transports/toolsets to
+enable.
+
+### 23.10 Future backlog
+
+> Every task below is **not implemented**. Each is specified so it can be
+> executed later without changing T01-T30 behaviour.
+
+#### Task 1 - SonarQube authentication configuration (mode skeleton)
+
+* **Goal:** add an optional `SONAR_AUTH_MODE` whose default (`token`) is
+  byte-for-byte equivalent to today.
+* **Scope:** configuration parsing/validation only; no new auth mechanism.
+* **Dependencies:** none.
+* **Prerequisites:** none.
+* **Security:** no secret serialization; unknown mode fails closed.
+* **Tests:** omitted mode equals `token`; unknown mode rejected; token path
+  unchanged; full suite green.
+* **Definition of Done:** documented, tested, backward compatible.
+* **Out of scope:** session/password/MCP.
+
+#### Task 2 - SonarQube username/password authentication
+
+* **Goal:** support `SONAR_AUTH_MODE=password` for the REST client only.
+* **Scope:** REST client auth; configuration; docs; tests.
+* **Dependencies:** Task 1.
+* **Prerequisites:** section 23.3 verification answered by the operator.
+* **Security:** password never logged/serialized/scanned-as-clean; scanner
+  untouched; fail closed on invalid/expired credentials.
+* **Tests:** login mapping, invalid credentials, expiry, redaction,
+  scanner-env invariance, backward compatibility.
+* **Definition of Done:** opt-in, tested, documented, token default unchanged.
+* **Out of scope:** SSO/MFA automation; retries; scanner password auth.
+
+#### Task 3 - GitLab authentication configuration
+
+* **Goal:** a configurable GitLab authentication method for a future GitLab
+  integration.
+* **Scope:** configuration + a client boundary decision; no API feature yet.
+* **Dependencies:** a decision on the desired GitLab capability.
+* **Prerequisites:** section 23.4 verification.
+* **Security:** credentials via env only; never in reports/scanner.
+* **Tests:** config validation; redaction; no-op when unconfigured.
+* **Definition of Done:** documented decision + config contract.
+* **Out of scope:** inventing GitLab APIs.
+
+#### Task 4 - GitLab authentication method selection
+
+* **Goal:** decide and document PAT vs OAuth vs password for the target
+  deployment.
+* **Scope:** decision record; not code.
+* **Prerequisites:** section 23.4 verification.
+* **Out of scope:** implementation until the decision is made.
+
+#### Task 5 - SonarQube MCP integration
+
+* **Goal:** optionally expose SonarQube tools to the Codex agent via MCP.
+* **Scope:** separate, opt-in integration module/launcher; docs.
+* **Dependencies:** a running official MCP server and a User token.
+* **Prerequisites:** target SonarQube Server 2025.1+/Community Build 25.1+;
+  Docker (available); explicit opt-in.
+* **Security:** treat MCP data as untrusted; prefer `SONARQUBE_READ_ONLY=true`;
+  no secret serialization.
+* **Tests:** fake MCP client; malformed response; auth failure; pipeline works
+  without MCP.
+* **Definition of Done:** opt-in, documented, does not affect T01-T30.
+* **Out of scope:** using MCP as the sole source for `FIXED`.
+
+#### Task 6 - GitLab MCP integration (candidate)
+
+* **Goal:** evaluate and, only if justified, integrate a GitLab MCP server.
+* **Dependencies:** Task 4 and section 23.6 verification.
+* **Prerequisites:** an appropriate/verified GitLab MCP server.
+* **Tests:** to be defined after verification.
+* **Definition of Done:** pending verification.
+* **Out of scope:** inventing a server or its capabilities.
+
+#### Task 7 - Credential security & secret management
+
+* **Goal:** ensure every new credential follows the existing redaction and
+  secret-scan rules.
+* **Scope:** redaction tables, `forbidden_secrets`, diagnostics, docs.
+* **Tests:** serialization exclusion; redaction; scanner-env invariance.
+* **Definition of Done:** no credential can reach a log, report, or command
+  line.
+* **Out of scope:** vault/secret-manager integration (not requested).
+
+#### Task 8 - Integration tests
+
+* **Goal:** end-to-end tests for the chosen modes using fakes/mocks only.
+* **Scope:** new test modules.
+* **Prerequisites:** the corresponding feature tasks.
+* **Out of scope:** real production credentials.
+
+#### Task 9 - Failure/timeout/retry behaviour
+
+* **Goal:** document fail-closed behaviour for the new integrations.
+* **Scope:** failure classification; no retry loops (out of scope).
+* **Definition of Done:** documented, consistent with T19/T27 fail-closed.
+* **Out of scope:** retry/backoff loops.
+
+#### Task 10 - CI/CD integration
+
+* **Goal:** document how CI would supply credentials for the chosen modes.
+* **Scope:** documentation; secrets via CI variables.
+* **Prerequisites:** the corresponding feature tasks.
+* **Out of scope:** changing current CI.
+
+#### Task 11 - Documentation & operational setup
+
+* **Goal:** operator runbooks for enabling any future mode.
+* **Scope:** README/spec/.env.example updates at implementation time.
+* **Out of scope:** documenting unimplemented behaviour as available.
+
+### 23.11 Definition of Done for this section
+
+This section is done when it accurately separates current, planned, candidate,
+and needs-verification items; introduces no unverified API or flow; and leaves
+T01-T30, the CLI, the scanner, CI, and secret redaction unchanged. It is a
+specification, not an implementation.
