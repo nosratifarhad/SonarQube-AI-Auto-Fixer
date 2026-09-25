@@ -1,0 +1,87 @@
+name: Bug report
+description: Report a reproducible problem with the project.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug.
+
+        **Do not include secrets, tokens, passwords, cookies, or `.env` contents.**
+        For security issues, use the private channel described in SECURITY.md instead.
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear, short description of the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What actually happened?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Exact steps so the problem can be reproduced.
+      placeholder: |
+        1. Configure ...
+        2. Run `python main.py ...`
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Python version, and any relevant tooling.
+      placeholder: |
+        - OS:
+        - Python version:
+        - SonarQube version (if relevant):
+        - Codex CLI / scanner (if relevant):
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: The branch or commit SHA you are running.
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and errors
+      description: Relevant output with all secrets removed.
+      render: text
+    validations:
+      required: false
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction (optional)
+      description: A small repository, script, or fixture that shows the problem.
+    validations:
+      required: false
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Confirmations
+      options:
+        - label: I have removed all secrets, tokens, and credentials from this report.
+          required: true
+        - label: I searched existing issues and did not find a duplicate.
+          required: true

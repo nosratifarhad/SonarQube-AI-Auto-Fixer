@@ -1,0 +1,13 @@
+# Default code owner for this repository.
+#
+# This repository currently has a single maintainer. CODEOWNERS is used to
+# request the right reviewer automatically.
+#
+# IMPORTANT: do NOT enable the branch-protection setting
+# "Require review from Code Owners" while there is only one maintainer, because
+# a maintainer cannot approve their own Pull Request and merges would deadlock.
+# Enable it only once there are at least two maintainers/reviewers.
+#
+# Replace or extend this file when more maintainers are added (see GOVERNANCE.md).
+
+* @nosratifarhad

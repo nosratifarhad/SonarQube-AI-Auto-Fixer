@@ -14,6 +14,31 @@ guarded by a standalone policy and is opt-in.
 > end-to-end run lives in the `pipeline/` package (T30) and is invoked through
 > `main.py --run`. Nothing is committed or pushed unless explicitly enabled.
 
+## Status
+
+| Item | Status |
+|------|--------|
+| Core pipeline (T01–T30) | Implemented and tested |
+| Test suite | 4000+ tests; runs with no external services |
+| CI | GitHub Actions on Linux + Windows |
+| Release | Pre-1.0; no tagged releases yet |
+| License | **Not chosen yet** — maintainer decision pending (see below) |
+| Future integrations (extra auth modes, GitLab, MCP) | Planned, not implemented |
+
+The implemented scope is guarded by a large, deterministic test suite. See
+[CHANGELOG.md](CHANGELOG.md) for what exists today.
+
+## Project layout
+
+| Path | What it is |
+|------|------------|
+| `main.py` | Entry point. Default = read-only issue listing; `--run` = full pipeline. |
+| `pipeline/` | Composition layer that wires the stages together (T30). |
+| root `*.py` modules | Independently tested stage and policy units (T01–T29), e.g. `sonar_client.py`, `codex_*.py`, `git_*.py`, `*_policy.py`, `*_report.py`. |
+| `tests/` | The pytest test suite. |
+| `docs/` | The full domain and behaviour specification. |
+| `.github/` | CI, issue and PR templates, Dependabot, CODEOWNERS. |
+
 ## What it does
 
 ```
@@ -54,7 +79,9 @@ A successful analysis alone is never treated as a fix.
 ## Requirements
 
 * Python 3.10+
-* `pip install -r requirements.txt`
+* Runtime dependencies: `python -m pip install -r requirements.txt`
+* For contributing (tests and tooling):
+  `python -m pip install -r requirements-dev.txt`
 * A local `git` executable and, for a real run, the SonarScanner (or any
   configured analysis command) and the Codex CLI.
 
@@ -175,13 +202,56 @@ CLI. It would sit *alongside* the existing REST client, never replace it.
 ## Tests
 
 ```bash
-.venv\Scripts\python -m pytest -q --cov=. --cov-report=term-missing
+python -m pytest -q
 ```
 
-The suite never needs a live SonarQube server, a real Codex CLI or a real
-project toolchain: every I/O boundary is injected.
+With coverage:
+
+```bash
+python -m pytest -q --cov=. --cov-report=term-missing
+```
+
+The suite never needs a live SonarQube server, a real Codex CLI, or a real
+project toolchain: every I/O boundary is injected. The same tests run in CI on
+Linux and Windows (`github.com/.../actions`).
+
+## Contributing
+
+Contributions are welcome. The workflow is:
+
+```
+Fork  ->  branch  ->  changes + tests  ->  Pull Request  ->  CI + review  ->  merge
+```
+
+* `main` is protected; changes go through Pull Requests.
+* CI must be green (tests on Linux and Windows).
+* Never commit secrets or `.env`.
+
+Read **[CONTRIBUTING.md](CONTRIBUTING.md)** for the full, beginner-friendly
+guide. See [GOVERNANCE.md](GOVERNANCE.md) for how decisions are made and
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community expectations.
+
+## Security
+
+Do not report security issues in public. Use GitHub's private
+**Report a vulnerability** flow. See **[SECURITY.md](SECURITY.md)** for details,
+supported versions, and what never to include in a report.
+
+## License
+
+**No open-source license has been chosen yet.** This is a maintainer/legal
+decision that is still pending. Until a `LICENSE` file is added, the project is
+publicly visible but **not** licensed for reuse, modification, or
+redistribution, and contributions cannot be redistributed by others.
+
+If you are the maintainer: pick a license (for example MIT or Apache-2.0),
+add it as `LICENSE`, and reference it here. If you are a contributor: please
+open an issue if you need this resolved before contributing.
 
 ## Documentation
 
-The full domain and behaviour specification is in
-[`docs/sonarqube-ai-fixer-spec.md`](docs/sonarqube-ai-fixer-spec.md).
+* Full domain and behaviour specification:
+  [`docs/sonarqube-ai-fixer-spec.md`](docs/sonarqube-ai-fixer-spec.md)
+  (the future-integrations plan is section 23).
+* Configuration template: [`.env.example`](.env.example).
+* Contribution guide: [CONTRIBUTING.md](CONTRIBUTING.md).

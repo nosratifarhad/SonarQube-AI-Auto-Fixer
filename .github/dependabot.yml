@@ -1,0 +1,23 @@
+# Dependency update automation.
+#
+# Kept deliberately small to avoid noise: only the ecosystems this repository
+# actually uses, at a low update frequency.
+
+version: 2
+updates:
+  # Python runtime and test dependencies (requirements.txt / requirements-dev.txt).
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore"
+
+  # GitHub Actions used by the CI workflow.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    commit-message:
+      prefix: "chore"
