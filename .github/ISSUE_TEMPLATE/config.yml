@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/nosratifarhad/SonarQube-AI-Auto-Fixer/security/advisories/new
+    about: Report security issues privately. Never post secrets or exploits in a public issue.
+  - name: Documentation and contributing guide
+    url: https://github.com/nosratifarhad/SonarQube-AI-Auto-Fixer/blob/main/CONTRIBUTING.md
+    about: Read the project overview, setup, and contribution workflow before opening an issue.
