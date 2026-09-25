@@ -135,6 +135,43 @@ post-analysis issue snapshot can only be attributed to this run under the
 with `FIXER_EXCLUSIVE_ANALYSIS=true`; without it, a verified absence stays
 `REVIEW_REQUIRED` rather than becoming `FIXED`.
 
+## Roadmap: future integrations & authentication
+
+> **This is a plan, not a feature list.** Nothing below is implemented. The
+> current release uses token-based SonarQube authentication only. Full detail,
+> evidence, and prerequisites are in the specification:
+> [`docs/sonarqube-ai-fixer-spec.md`](docs/sonarqube-ai-fixer-spec.md) **section 23**.
+
+| Capability | Today | Future | Status |
+|------------|-------|--------|--------|
+| SonarQube token auth | Supported (HTTP Basic `token:`) | Keep as default | Current |
+| SonarQube scanner auth | `SONAR_HOST_URL` + `SONAR_TOKEN` | Keep unchanged | Current |
+| SonarQube username/password | Not supported | Considered | Planned, needs verification |
+| GitLab integration (any) | None (generic Git remote only) | Considered | Planned, needs verification |
+| GitLab username/password | Not supported | Decision point | Needs verification |
+| SonarQube MCP | Not supported | Considered | Planned, not implemented |
+| GitLab MCP | Not supported | Candidate | Needs verification |
+
+**Why these are future items.** They are useful only if the target deployments
+support them. The specification marks each as `Current`, `Planned`,
+`Candidate`, or `Needs verification` so nothing is presented as working when it
+is not.
+
+**What does NOT change.** Token authentication stays the default, the scanner
+keeps using its own token/environment mechanism, the CLI and its safety gates
+are unchanged, and secret redaction is unchanged.
+
+**Before any implementation, these must be verified** against the real
+environments: the SonarQube version (MCP requires Server 2025.1+ / Community
+Build 25.1+), the token type (a User token is required for MCP), the
+SSO/SAML/MFA posture, and the target GitLab version/edition plus its supported
+automation authentication method.
+
+**MCP snapshot (verified).** The official `sonarsource/sonarqube-mcp` server
+requires a User token and a recent SonarQube version, supports Stdio and
+Streamable HTTP, offers a read-only mode, and can be configured for the Codex
+CLI. It would sit *alongside* the existing REST client, never replace it.
+
 ## Tests
 
 ```bash
